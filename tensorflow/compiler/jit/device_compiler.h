@@ -127,7 +127,7 @@ class DeviceCompiler : public ResourceBase {
     return compiler_client_.get();
   }
   XlaBatchMatcher* xla_batch_matcher() { return xla_batch_matcher_.get(); }
-  
+
   string DebugString() const override;
 
  private:
