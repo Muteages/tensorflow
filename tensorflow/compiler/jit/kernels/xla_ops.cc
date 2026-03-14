@@ -1097,7 +1097,6 @@ XlaRunOp::XlaRunOp(OpKernelConstruction* ctx)
 void XlaRunOp::Compute(OpKernelContext* ctx) {
   VLOG(3) << "XlaRunOp " << def().name();
   Tensor key_tensor = ctx->input(ctx->num_inputs() - 1);
-  std::vector<const Tensor*> inputs = InputsFromContext(ctx);
   bool use_pjrt =
       GetXlaOpsCommonFlags()
           ->tf_xla_use_device_api.IsEnabledInXlaCompileAndRunForDevice(
@@ -1183,16 +1182,26 @@ void XlaRunOp::Compute(OpKernelContext* ctx) {
   if (flags->tf_xla_enable_dynamic_sizes) {
     bool is_set = false;
     std::set<int64_t> dyn_vals;
-    for (int i = 0; i < closure.compilation_result()->xla_input_shapes.size(); i++) {
-      const auto& xlaShape = closure.compilation_result()->xla_input_shapes[i];
-      if (!xlaShape.IsArray() || xlaShape.expressions().empty()) continue;
-      for (int dim = 0; dim < xlaShape.expressions().size(); dim++) {
-        xla::DynExpr* expr = xlaShape.expressions(dim);
+    const auto* comp_result = closure.compilation_result();
+    const int num_constant_args = closure.num_constant_args();
+    for (int i = 0; i < comp_result->xla_input_shapes.size(); i++) {
+      const auto& xla_shape = closure.compilation_result()->xla_input_shapes[i];
+      if (!xla_shape.IsArray() || xla_shape.expressions().empty()) continue;
+
+      for (int dim = 0; dim < xla_shape.expressions().size(); dim++) {
+        xla::DynExpr* expr = xla_shape.expressions(dim);
         if (expr && expr->is_dynamic()) {
-          int64_t size = inputs[i]->shape().dim_size(dim);
+          int input_idx = comp_result->input_mapping[i] - num_constant_args;
+          if (input_idx < 0 || input_idx >= ctx->num_inputs()) {
+            VLOG(1) << "Warning: Input index is out of range";
+            continue;
+          }
+          VLOG(1) << "input shape is " << ctx->input(input_idx).shape()
+                  << ", corresponding xla input shape is " << xla_shape;
+          int64_t size = ctx->input(input_idx).shape().dim_size(dim);
           int64_t dyn_val = expr->solve(size); // TODO: check if the result is correct later.
-          VLOG(1) << "Found dynamic input, real size is: " << size
-                        << ", dyn_val is " << dyn_val;
+          VLOG(1) << "Found dynamic input. Real size is: " << size
+                        << ", solved dynamic value is " << dyn_val;
           if (dyn_val == -1) {
             VLOG(1) << "Warning: Failed to solve the expression";
             continue;
