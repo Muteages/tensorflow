@@ -784,8 +784,28 @@ void TensorShapeBase<Shape>::RemoveDimRange(int begin, int end) {
   if (begin >= end) return;
   absl::InlinedVector<int64_t, 8UL> vals;
   AppendTo(*this, &vals);
+  std::vector<xla::DynExpr*> new_exprs = get_expressions();
+  if (begin < static_cast<int64_t>(new_exprs.size())) {
+    int64_t expr_end = end;
+    if (expr_end > static_cast<int64_t>(new_exprs.size())) {
+      expr_end = new_exprs.size();
+    }
+    if (expr_end > begin) {
+      new_exprs.erase(new_exprs.begin() + begin, new_exprs.begin() + expr_end);
+    }
+  }
+
   vals.erase(vals.begin() + begin, vals.begin() + end);
+
+  // Truncate if the removed dims reduce rank below expression vector size.
+  const int64_t new_rank = vals.size();
+  if (new_exprs.size() > static_cast<size_t>(new_rank)) {
+    new_exprs.resize(new_rank);
+  }
+
+
   ClearAllButDataType();
+  set_expressions(new_exprs);
   for (auto dval : vals) {
     AddDim(dval);
   }
@@ -823,9 +843,28 @@ absl::Status TensorShapeBase<Shape>::RemoveDimRangeWithStatus(int begin,
 
   absl::InlinedVector<int64_t, 8UL> vals;
   AppendTo(*this, &vals);
+
+  std::vector<xla::DynExpr*> new_exprs = get_expressions();
+
+  if (begin < static_cast<int64_t>(new_exprs.size())) {
+    int64_t expr_end = end;
+    if (expr_end > static_cast<int64_t>(new_exprs.size())) {
+      expr_end = new_exprs.size();
+    }
+    if (expr_end > begin) {
+      new_exprs.erase(new_exprs.begin() + begin, new_exprs.begin() + expr_end);
+    }
+  }
+
   vals.erase(vals.begin() + begin, vals.begin() + end);
   ClearAllButDataType();
 
+  const int64_t new_rank = vals.size();
+  if (new_exprs.size() > static_cast<size_t>(new_rank)) {
+    new_exprs.resize(new_rank);
+  }
+
+  set_expressions(new_exprs);
   absl::Status s = absl::OkStatus();
   for (auto dval : vals) {
     s.Update(AddDimWithStatus(dval));
