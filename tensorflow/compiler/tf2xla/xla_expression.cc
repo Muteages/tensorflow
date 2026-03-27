@@ -19,6 +19,7 @@ limitations under the License.
 #include "tensorflow/compiler/tf2xla/shape_util.h"
 #include "tensorflow/core/framework/tensor_shape.pb.h"
 #include "xla/hlo/builder/value_inference.h"
+#include "tsl/platform/protobuf.h"
 #include "tensorflow/core/framework/types.pb.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/platform/logging.h"
@@ -107,8 +108,11 @@ xla::XlaOp XlaExpression::AsXlaOp(xla::XlaBuilder* builder) const {
             std::to_string(*dynamic_constant_index_);
         xla::ExpressionProto expr_proto;
         dynamic_constant_expr_->to_proto(&expr_proto);
-        (*attributes.mutable_map())["dynamic_constant_expr"] =
-            expr_proto.ShortDebugString();
+        std::string expr_textproto =
+            tsl::LegacyUnredactedShortDebugString(expr_proto);
+        VLOG(1) << "AsXlaOp: expr_textproto is " << expr_textproto
+                  << " ShortDebugString is " << expr_proto.ShortDebugString();
+        (*attributes.mutable_map())["dynamic_constant_expr"] = expr_textproto;
         VLOG(1) << "Marking HLO constant with dynamic_constant_index="
                 << *dynamic_constant_index_
                 << " dynamic_constant_expr="

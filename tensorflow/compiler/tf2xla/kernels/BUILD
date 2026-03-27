@@ -2200,6 +2200,7 @@ tf_kernel_library(
         "//tensorflow/compiler/tf2xla/ops:xla_ops",
         "//tensorflow/core:framework",
         "//tensorflow/core:protos_all_cc",
+        "@local_tsl//tsl/platform:protobuf",
         "@local_xla//xla/hlo/builder:xla_builder",
     ],
 )

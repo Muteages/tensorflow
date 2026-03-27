@@ -739,6 +739,7 @@ cc_library(
         "//tensorflow/core:protos_all_cc",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/types:optional",
+        "@local_tsl//tsl/platform:protobuf",
         "@local_xla//xla/client",
         "@local_xla//xla/hlo/builder:value_inference",
         "@local_xla//xla/hlo/builder:xla_builder",
