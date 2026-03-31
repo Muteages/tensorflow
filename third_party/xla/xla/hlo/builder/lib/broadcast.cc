@@ -48,6 +48,12 @@ absl::StatusOr<XlaOp> BroadcastTo(
         ") must have rank less than or equal to the output shape [",
         absl::StrJoin(output_dims, ","), "]");
   }
+  
+  if (!output_exprs.empty() && output_exprs.size() != output_dims.size()) {
+  return tsl::errors::InvalidArgument(
+      "output_exprs must be empty or have the same rank as output_dims: ",
+      output_exprs.size(), " vs ", output_dims.size());
+  }
 
   std::vector<int64_t> broadcast_dims;
   std::vector<int64_t> broadcast_shape;
@@ -79,20 +85,23 @@ absl::StatusOr<XlaOp> BroadcastTo(
     }
   }
   TF_RET_CHECK(input_it == input_dims.rend());
-
   absl::Span<DynExpr* const> input_exprs = input_shape.expressions();
   std::vector<DynExpr*> broadcast_exprs;
+  auto input_dim_et = input_dims.rbegin();
   auto input_et = input_exprs.rbegin();
+  auto output_dim_et = output_dims.rbegin();
   for (auto output_et = output_exprs.rbegin(); output_et != output_exprs.rend();
-       ++output_et) {
+       ++output_et, ++output_dim_et) {
     if (input_et != input_exprs.rend()) {
-      if (*(*output_et) == *(*input_et) ||
+      if (*output_dim_et == *input_dim_et || *input_dim_et == 1 ||
+          *(*output_et) == *(*input_et) ||
           (*input_et)->is_constant() && (*input_et)->get_val() == 1) {
         broadcast_exprs.push_back(*output_et);
       } else if (!(*(*output_et) == *(*input_et))) {
         broadcast_exprs.push_back(*input_et);
         broadcast_exprs.push_back((**output_et / **input_et)->s());
       }
+      ++input_dim_et;
       ++input_et;
     } else {
       broadcast_exprs.push_back(*output_et);
