@@ -41,6 +41,23 @@ limitations under the License.
 
 namespace xla {
 
+namespace {
+bool IsExactlyDivisible(int64_t numerator, int64_t denominator) {
+  return denominator != 0 && numerator % denominator == 0;
+}
+
+void ExtractConstantOperand(DynExpr* lhs, DynExpr* rhs,
+                            Constant*& out_const, DynExpr*& out_other) {
+  if (lhs->kind() == DExpr::Kind::kConstant) {
+    out_const = static_cast<Constant*>(lhs);
+    out_other = rhs;
+  } else if (rhs->kind() == DExpr::Kind::kConstant) {
+    out_const = static_cast<Constant*>(rhs);
+    out_other = lhs;
+  }
+}
+}  // namespace
+
 const DExpr& Shape::MissingExpression() {
   static const DExpr missing = DExpr::Unknown();
   return missing;
@@ -359,24 +376,38 @@ DynExpr* Div::s() {
   if (l && r) return DynExpr::_(l->get_val() / r->get_val());
   // X / 1 = X
   if (r && r->get_val() == 1) return s_lhs.release();
-  // (X + Y) / Z = (X/Z) + (Y/Z)
+  // (X + Y) / Z = (X / Z) + (Y / Z) when Y is constant and divisible by Z.
   if (s_lhs->kind() == DExpr::Kind::kAdd) {
     auto* XY = static_cast<Add*>(s_lhs.get());
     DynExpr* X = XY->get_lhs();
     DynExpr* Y = XY->get_rhs();
-    auto left = std::unique_ptr<DynExpr>(*X / *s_rhs);
-    auto right = std::unique_ptr<DynExpr>(*Y / *s_rhs);
-    auto distributed = std::unique_ptr<DynExpr>(*left + *right);
-    return distributed->s();
+    Constant* constant = nullptr;
+    DynExpr* other = nullptr;
+    ExtractConstantOperand(X, Y, constant, other);
+    if (r && constant && IsExactlyDivisible(constant->get_val(), r->get_val())) {
+      auto quotient = constant->get_val() / r->get_val();
+      auto residual = std::unique_ptr<DynExpr>(*other / *s_rhs);
+      auto distributed =
+          std::unique_ptr<DynExpr>(*residual + quotient);
+      return distributed->s();
+    }
+    return *s_lhs / *s_rhs;
   }
-  // (X * Y) / Z = (X/Z) * Y
+  // (X * Y) / Z = X * (Y / Z) when Y is constant and divisible by Z
   if (s_lhs->kind() == DExpr::Kind::kMul) {
     auto* XY = static_cast<Mul*>(s_lhs.get());
     DynExpr* X = XY->get_lhs();
     DynExpr* Y = XY->get_rhs();
-    auto left = std::unique_ptr<DynExpr>(*X / *s_rhs);
-    auto distributed = std::unique_ptr<DynExpr>(*left * (*Y));
-    return distributed->s();
+    Constant* constant = nullptr;
+    DynExpr* other = nullptr;
+    ExtractConstantOperand(X, Y, constant, other);
+    if (r && constant && IsExactlyDivisible(constant->get_val(), r->get_val())) {
+      auto quotient = constant->get_val() / r->get_val();
+      auto distributed =
+          std::unique_ptr<DynExpr>(quotient * (*other));
+      return distributed->s();
+    }
+    return *s_lhs / *s_rhs;
   }
   // (X / Y) / Z = X / (Y*Z)
   if (s_lhs->kind() == DExpr::Kind::kDiv) {
