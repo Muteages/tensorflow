@@ -19,6 +19,7 @@ limitations under the License.
 #include "tensorflow/compiler/jit/encapsulate_subgraphs_pass.h"
 #include "tensorflow/compiler/jit/encapsulate_xla_computations_pass.h"
 #include "tensorflow/compiler/jit/force_xla_constants_on_host_pass.h"
+#include "tensorflow/compiler/jit/freeze_readonly_variables_pass.h"
 #include "tensorflow/compiler/jit/increase_dynamism_for_auto_jit_pass.h"
 #include "tensorflow/compiler/jit/mark_for_compilation_pass.h"
 #include "tensorflow/compiler/jit/partially_decluster_pass.h"
@@ -47,6 +48,9 @@ REGISTER_OPTIMIZATION(OptimizationPassRegistry::PRE_PLACEMENT, 36,
 
 REGISTER_OPTIMIZATION(OptimizationPassRegistry::POST_REWRITE_FOR_EXEC, 5,
                       CloneConstantsForBetterClusteringPass);
+
+REGISTER_OPTIMIZATION(OptimizationPassRegistry::POST_REWRITE_FOR_EXEC, 8,
+                      FreezeReadonlyVariablesPass);
 
 REGISTER_OPTIMIZATION(OptimizationPassRegistry::POST_REWRITE_FOR_EXEC, 9,
                       ClusterScopingPass);
