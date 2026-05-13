@@ -54,6 +54,7 @@ limitations under the License.
 #include "xla/service/custom_call_status_internal.h"
 #include "xla/service/executable.h"
 #include "xla/service/hlo_execution_profile.h"
+#include "xla/service/hlo_profile_printer.h"
 #include "xla/service/hlo_profile_printer_data.pb.h"
 #include "xla/service/hlo_value.h"
 #include "xla/service/maybe_owning_device_memory.h"
@@ -75,6 +76,20 @@ limitations under the License.
 
 namespace xla {
 namespace cpu {
+
+namespace {
+
+float GetClockRateGhz(const ExecutableRunOptions* run_options) {
+  if (run_options->stream() == nullptr ||
+      run_options->stream()->parent() == nullptr) {
+    return 1.0f;
+  }
+  float clock_rate_ghz =
+      run_options->stream()->parent()->GetDeviceDescription().clock_rate_ghz();
+  return clock_rate_ghz > 0 ? clock_rate_ghz : 1.0f;
+}
+
+}  // namespace
 
 absl::StatusOr<std::unique_ptr<CpuExecutable>> CpuExecutable::Create(
     std::unique_ptr<FunctionLibrary> function_library,
@@ -246,8 +261,16 @@ absl::Status CpuExecutable::ExecuteComputeFunction(
     absl::Span<MaybeOwningDeviceMemory const> buffers) {
   uint64_t start_micros = tsl::Env::Default()->NowMicros();
 
-  size_t profile_counters_size = 0;
+  std::vector<int64_t> profile_counter_storage;
+  if (hlo_profiling_enabled()) {
+    profile_counter_storage.assign(
+        hlo_profile_printer_data().profile_counters_size(), 0);
+  }
+  size_t profile_counters_size = profile_counter_storage.size();
   int64_t* profile_counters = nullptr;
+  if (!profile_counter_storage.empty()) {
+    profile_counters = profile_counter_storage.data();
+  }
 
   // Call the computation function following the calling convention. See the
   // definition of 'ComputeFunctionType' for the details of the calling
@@ -286,6 +309,15 @@ absl::Status CpuExecutable::ExecuteComputeFunction(
   compute_function_(nullptr, run_options, nullptr, buffer_pointers.data(),
                     &status, profile_counters);
   record_profile();
+  if (profile_counters != nullptr) {
+    std::string hlo_profile =
+        PrintHloProfile(hlo_profile_printer_data(), profile_counters,
+                        GetClockRateGhz(run_options));
+    if (!hlo_profile.empty()) {
+      LOG(INFO) << "XLA:CPU HLO profile for " << module().name() << "\n"
+                << hlo_profile;
+    }
+  }
   std::optional<absl::string_view> error_message =
       CustomCallStatusGetMessage(&status);
   if (error_message) {

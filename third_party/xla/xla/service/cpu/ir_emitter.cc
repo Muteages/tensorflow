@@ -3715,10 +3715,26 @@ void IrEmitter::ProfilingState::UpdateProfileCounter(llvm::IRBuilderBase* b,
                                                      llvm::Value* prof_counter,
                                                      llvm::Value* cycle_end,
                                                      llvm::Value* cycle_start) {
+  llvm::Value* profile_counters = prof_counter;
+  if (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(prof_counter)) {
+    profile_counters = gep->getPointerOperand();
+  }
+
+  auto* profile_counters_type =
+      llvm::cast<llvm::PointerType>(profile_counters->getType());
+  llvm::Value* has_profile_counters = b->CreateICmpNE(
+      profile_counters, llvm::ConstantPointerNull::get(profile_counters_type),
+      "has_profile_counters");
+
+  llvm::AllocaInst* dummy_counter = llvm_ir::EmitAllocaAtFunctionEntry(
+      b->getInt64Ty(), "dummy_profile_counter", b);
+  b->CreateStore(b->getInt64(0), dummy_counter);
+  prof_counter =
+      b->CreateSelect(has_profile_counters, prof_counter, dummy_counter);
+
   auto* cycle_diff = b->CreateSub(cycle_end, cycle_start);
   llvm::LoadInst* old_cycle_count = b->CreateLoad(
-      llvm::cast<llvm::GetElementPtrInst>(prof_counter)->getSourceElementType(),
-      prof_counter, "old_cycle_count");
+      b->getInt64Ty(), prof_counter, "old_cycle_count");
   auto* new_cycle_count =
       b->CreateAdd(cycle_diff, old_cycle_count, "new_cycle_count");
   b->CreateStore(new_cycle_count, prof_counter);
@@ -3728,10 +3744,17 @@ llvm::Value* IrEmitter::ProfilingState::ReadCycleCounter(
     llvm::IRBuilderBase* b) {
   llvm::Module* module = b->GetInsertBlock()->getModule();
   if (!use_rdtscp_) {
-    llvm::Function* func_llvm_readcyclecounter =
-        llvm::Intrinsic::getOrInsertDeclaration(
-            module, llvm::Intrinsic::readcyclecounter);
-    return b->CreateCall(func_llvm_readcyclecounter);
+    llvm::FunctionType* fn_type =
+        llvm::FunctionType::get(b->getInt64Ty(), /*isVarArg=*/false);
+    llvm::FunctionCallee read_cycle_counter_func =
+        module->getOrInsertFunction(runtime::kReadCycleCounterSymbolName,
+                                    fn_type);
+    if (auto* fn =
+            llvm::dyn_cast<llvm::Function>(read_cycle_counter_func.getCallee())) {
+      fn->setCallingConv(llvm::CallingConv::C);
+      fn->setDoesNotThrow();
+    }
+    return b->CreateCall(read_cycle_counter_func);
   }
   llvm::Function* func_llvm_x86_rdtscp =
       llvm::Intrinsic::getOrInsertDeclaration(module,

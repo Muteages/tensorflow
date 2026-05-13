@@ -60,6 +60,7 @@ limitations under the License.
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/tsl/concurrency/async_value_ref.h"
 #include "xla/tsl/platform/errors.h"
+#include "xla/tsl/platform/env_time.h"
 #include "xla/tsl/platform/logging.h"
 #include "xla/tsl/platform/status.h"
 #include "xla/util.h"
@@ -166,6 +167,8 @@ extern const char* const kParallelForkJoinSymbolName =
     "__xla_cpu_runtime_ParallelForkJoin";
 extern const char* const kPrintfToStderrSymbolName =
     "__xla_cpu_runtime_PrintfToStderr";
+extern const char* const kReadCycleCounterSymbolName =
+    "__xla_cpu_runtime_ReadCycleCounter";
 extern const char* const kStatusIsSuccessSymbolName =
     "__xla_cpu_runtime_StatusIsSuccess";
 extern const char* const kKeyValueSortSymbolName =
@@ -618,6 +621,11 @@ ABSL_ATTRIBUTE_NO_SANITIZE_MEMORY int __xla_cpu_runtime_PrintfToStderr(
   int result = vfprintf(stderr, format, args);
   va_end(args);
   return result;
+}
+
+ABSL_ATTRIBUTE_NO_SANITIZE_MEMORY uint64_t
+__xla_cpu_runtime_ReadCycleCounter() {
+  return tsl::EnvTime::NowNanos();
 }
 
 ABSL_ATTRIBUTE_NO_SANITIZE_MEMORY int64_t __xla_cpu_runtime_TracingStart(

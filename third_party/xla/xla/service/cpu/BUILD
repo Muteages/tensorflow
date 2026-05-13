@@ -1123,6 +1123,7 @@ cc_library(
         "//xla/stream_executor:stream_executor_h",
         "//xla/tsl/concurrency:async_value",
         "//xla/tsl/platform:errors",
+        "//xla/tsl/platform:env_time",
         "//xla/tsl/platform:logging",
         "//xla/tsl/platform:status",
         "@com_google_absl//absl/algorithm:container",
