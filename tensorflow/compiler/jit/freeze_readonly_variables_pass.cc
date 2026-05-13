@@ -2,12 +2,14 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/strings/match.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_join.h"
 #include "tensorflow/core/framework/node_def.pb.h"
 #include "tensorflow/core/framework/node_def_util.h"
@@ -29,10 +31,26 @@ namespace tensorflow {
 namespace {
 
 constexpr char kCheckpointEnvVar[] = "TF_XLA_FREEZE_VARIABLES_CHECKPOINT";
+constexpr char kMaxTensorBytesEnvVar[] = "TF_XLA_FREEZE_VARIABLES_MAX_BYTES";
+constexpr int64_t kDefaultMaxTensorBytes = 16LL * 1024 * 1024;
+
+int64_t MaxTensorBytes() {
+  const char* value = std::getenv(kMaxTensorBytesEnvVar);
+  if (value == nullptr || value[0] == '\0') return kDefaultMaxTensorBytes;
+
+  int64_t parsed = 0;
+  if (!absl::SimpleAtoi(value, &parsed) || parsed < 0) {
+    LOG(WARNING) << "Ignoring invalid " << kMaxTensorBytesEnvVar << "=" << value
+                 << "; using " << kDefaultMaxTensorBytes;
+    return kDefaultMaxTensorBytes;
+  }
+  return parsed;
+}
 
 struct FrozenVariable {
   std::string checkpoint_key;
   DataType dtype = DT_INVALID;
+  int64_t estimated_bytes = -1;
   TensorProto value;
 };
 
@@ -49,9 +67,24 @@ struct RewriteStats {
   int rewritten_gathers = 0;
   int rewritten_gather_nds = 0;
   int skipped_missing_value = 0;
+  int skipped_too_large = 0;
+  int skipped_partitioned = 0;
   int skipped_unsafe = 0;
   int skipped_unsupported = 0;
 };
+
+bool EstimateTensorBytes(DataType dtype, const TensorShape& shape,
+                         int64_t* estimated_bytes) {
+  const int64_t elements = shape.num_elements();
+  const int dtype_size = DataTypeSize(dtype);
+  if (elements < 0 || dtype_size <= 0) return false;
+  if (elements > std::numeric_limits<int64_t>::max() / dtype_size) {
+    *estimated_bytes = std::numeric_limits<int64_t>::max();
+    return true;
+  }
+  *estimated_bytes = elements * dtype_size;
+  return true;
+}
 
 std::string OptionalSharedName(const Node& node) {
   std::string shared_name;
@@ -168,14 +201,26 @@ void AddCandidateCheckpointKeyVariants(absl::string_view key,
   if (absl::StartsWith(key, "varhandle/")) {
     bases.push_back(std::string(key.substr(strlen("varhandle/"))));
   }
-  if (absl::StartsWith(key, "unclustered/")) {
-    bases.push_back(std::string(key.substr(strlen("unclustered/"))));
-  }
+  // if (absl::StartsWith(key, "unclustered/")) {
+  //   bases.push_back(std::string(key.substr(strlen("unclustered/"))));
+  // }
 
   for (const std::string& base : bases) {
     AddCheckpointKey(base, keys);
-    if (absl::EndsWith(base, "/part_0")) {
-      AddCheckpointKey(base.substr(0, base.size() - strlen("/part_0")), keys);
+
+    const size_t part_pos = base.rfind("/part_");
+    if (part_pos != std::string::npos) {
+      const size_t part_index_pos = part_pos + strlen("/part_");
+      bool has_part_index = part_index_pos < base.size();
+      for (size_t i = part_index_pos; i < base.size(); ++i) {
+        if (base[i] < '0' || base[i] > '9') {
+          has_part_index = false;
+          break;
+        }
+      }
+      if (has_part_index) {
+        AddCheckpointKey(base.substr(0, part_pos), keys);
+      }
     }
   }
 }
@@ -194,7 +239,8 @@ std::vector<std::string> CandidateCheckpointKeys(const Node& node) {
 class CheckpointTensorReader {
  public:
   explicit CheckpointTensorReader(absl::string_view checkpoint_prefix)
-      : reader_(Env::Default(), checkpoint_prefix) {}
+      : reader_(Env::Default(), checkpoint_prefix),
+        max_tensor_bytes_(MaxTensorBytes()) {}
 
   absl::Status status() const { return reader_.status(); }
 
@@ -203,10 +249,30 @@ class CheckpointTensorReader {
     for (const std::string& key : keys) {
       if (!reader_.Contains(key)) continue;
 
+      std::vector<TensorSlice> slices;
+      absl::Status status = reader_.LookupTensorSlices(key, &slices);
+      if (!status.ok()) return status;
+      if (!slices.empty()) {
+        return errors::FailedPrecondition(
+            "checkpoint tensor is partitioned; slice-aware freeze is "
+            "required: ",
+            key, " slices=", slices.size());
+      }
+
       DataType dtype = DT_INVALID;
       TensorShape shape;
-      absl::Status status = reader_.LookupDtypeAndShape(key, &dtype, &shape);
+      status = reader_.LookupDtypeAndShape(key, &dtype, &shape);
       if (!status.ok()) return status;
+
+      int64_t estimated_bytes = -1;
+      if (EstimateTensorBytes(dtype, shape, &estimated_bytes) &&
+          estimated_bytes > max_tensor_bytes_) {
+        return errors::ResourceExhausted(
+            "checkpoint tensor exceeds freeze byte limit: key=", key,
+            " dtype=", DataTypeString(dtype), " shape=", shape.DebugString(),
+            " estimated_bytes=", estimated_bytes,
+            " max_bytes=", max_tensor_bytes_);
+      }
 
       Tensor tensor(dtype, shape);
       status = reader_.Lookup(key, &tensor);
@@ -214,6 +280,7 @@ class CheckpointTensorReader {
 
       frozen->checkpoint_key = key;
       frozen->dtype = dtype;
+      frozen->estimated_bytes = estimated_bytes;
       tensor.AsProtoTensorContent(&frozen->value);
       return absl::OkStatus();
     }
@@ -222,12 +289,36 @@ class CheckpointTensorReader {
 
  private:
   BundleReader reader_;
+  const int64_t max_tensor_bytes_;
 };
 
 bool AttrTypeEquals(const Node& node, absl::string_view attr_name,
                     DataType expected) {
   DataType actual = DT_INVALID;
   return GetNodeAttr(node.def(), attr_name, &actual).ok() && actual == expected;
+}
+
+bool IsFrozenValueCompatibleWithNode(const Node& node,
+                                     const FrozenVariable& frozen) {
+  DataType node_dtype = DT_INVALID;
+  if (GetNodeAttr(node.def(), "dtype", &node_dtype).ok() &&
+      node_dtype != frozen.dtype) {
+    return false;
+  }
+
+  PartialTensorShape node_shape;
+  if (!GetNodeAttr(node.def(), "shape", &node_shape).ok()) {
+    return true;
+  }
+
+  PartialTensorShape frozen_shape;
+  if (!PartialTensorShape::BuildPartialTensorShape(frozen.value.tensor_shape(),
+                                                   &frozen_shape)
+           .ok()) {
+    return false;
+  }
+
+  return node_shape.IsCompatibleWith(frozen_shape);
 }
 
 bool IsSafeResourceConsumer(const Node& consumer,
@@ -250,6 +341,10 @@ bool IsSafeResourceConsumer(const Node& consumer,
 }
 
 bool IsSafeToFreeze(const Node& node, const FrozenVariable& frozen) {
+  if (!IsFrozenValueCompatibleWithNode(node, frozen)) {
+    return false;
+  }
+
   for (const Edge* edge : node.out_edges()) {
     if (edge->IsControlEdge()) continue;
 
@@ -422,11 +517,25 @@ absl::Status FreezeReadonlyVariablesPass::Run(
     std::vector<std::string> candidate_keys = CandidateCheckpointKeys(*node);
     absl::Status lookup_status = tensor_reader.Lookup(candidate_keys, &frozen);
     if (!lookup_status.ok()) {
-      ++stats.skipped_missing_value;
-      VLOG(2) << "FreezeReadonlyVariablesPass: no checkpoint value for "
-              << node->name() << " shared_name=" << OptionalSharedName(*node)
-              << " candidates=[" << absl::StrJoin(candidate_keys, ", ")
-              << "]: " << lookup_status;
+      if (errors::IsResourceExhausted(lookup_status)) {
+        ++stats.skipped_too_large;
+        VLOG(1) << "FreezeReadonlyVariablesPass: skip large variable "
+                << node->name() << " shared_name=" << OptionalSharedName(*node)
+                << " candidates=[" << absl::StrJoin(candidate_keys, ", ")
+                << "]: " << lookup_status;
+      } else if (errors::IsFailedPrecondition(lookup_status)) {
+        ++stats.skipped_partitioned;
+        VLOG(1) << "FreezeReadonlyVariablesPass: skip partitioned variable "
+                << node->name() << " shared_name=" << OptionalSharedName(*node)
+                << " candidates=[" << absl::StrJoin(candidate_keys, ", ")
+                << "]: " << lookup_status;
+      } else {
+        ++stats.skipped_missing_value;
+        VLOG(2) << "FreezeReadonlyVariablesPass: no checkpoint value for "
+                << node->name() << " shared_name=" << OptionalSharedName(*node)
+                << " candidates=[" << absl::StrJoin(candidate_keys, ", ")
+                << "]: " << lookup_status;
+      }
       continue;
     }
 
@@ -449,6 +558,7 @@ absl::Status FreezeReadonlyVariablesPass::Run(
               << " op=" << node->type_string()
               << " shared_name=" << OptionalSharedName(*node)
               << " checkpoint_key=" << frozen.checkpoint_key
+              << " estimated_bytes=" << frozen.estimated_bytes
               << " dtype=" << DataTypeString(frozen.dtype);
     std::vector<EdgeSpec> inputs = ControlInputs(*node);
     NodeDef node_def = ConstNodeDef(*node, frozen);
@@ -498,6 +608,8 @@ absl::Status FreezeReadonlyVariablesPass::Run(
             << " rewritten_gathers=" << stats.rewritten_gathers
             << " rewritten_gather_nds=" << stats.rewritten_gather_nds
             << " skipped_missing_value=" << stats.skipped_missing_value
+            << " skipped_too_large=" << stats.skipped_too_large
+            << " skipped_partitioned=" << stats.skipped_partitioned
             << " skipped_unsafe=" << stats.skipped_unsafe;
 
   const std::string after_dump = DumpGraphToFile(
