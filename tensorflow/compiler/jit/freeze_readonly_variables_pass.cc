@@ -1,5 +1,6 @@
 #include "tensorflow/compiler/jit/freeze_readonly_variables_pass.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
@@ -27,6 +28,7 @@
 #include "tensorflow/core/platform/types.h"
 #include "tensorflow/core/util/dump_graph.h"
 #include "tensorflow/core/util/tensor_bundle/tensor_bundle.h"
+#include "xla/status_macros.h"
 
 namespace tensorflow {
 namespace {
@@ -34,6 +36,8 @@ namespace {
 constexpr char kCheckpointEnvVar[] = "TF_XLA_FREEZE_VARIABLES_CHECKPOINT";
 constexpr char kMaxTensorBytesEnvVar[] = "TF_XLA_FREEZE_VARIABLES_MAX_BYTES";
 constexpr char kFreezePolicyEnvVar[] = "TF_XLA_FREEZE_VARIABLES_POLICY";
+constexpr char kReadPathFreezeEnvVar[] =
+    "TF_XLA_FREEZE_READONLY_VARIABLES_READ_PATH";
 constexpr char kParameterMaxBytesEnvVar[] =
     "TF_XLA_FREEZE_VARIABLES_PARAMETER_MAX_BYTES";
 constexpr int64_t kDefaultMaxTensorBytes = 16LL * 1024 * 1024;
@@ -86,6 +90,16 @@ absl::string_view FreezePolicyName(FreezePolicy policy) {
   return "valuable_parameters";
 }
 
+bool EnvFlagEnabled(absl::string_view env_var) {
+  const std::string env_var_name(env_var);
+  const char* value = std::getenv(env_var_name.c_str());
+  if (value == nullptr || value[0] == '\0') return false;
+
+  const std::string normalized = ToLower(value);
+  return normalized == "1" || normalized == "true" || normalized == "yes" ||
+         normalized == "on";
+}
+
 int64_t MaxTensorBytes() {
   const char* value = std::getenv(kMaxTensorBytesEnvVar);
   if (value == nullptr || value[0] == '\0') return kDefaultMaxTensorBytes;
@@ -127,12 +141,24 @@ struct EdgeSpec {
   int dst_input = Graph::kControlSlot;
 };
 
+struct OutputEdgeSpec {
+  Node* dst = nullptr;
+  int src_output = Graph::kControlSlot;
+  int dst_input = Graph::kControlSlot;
+};
+
 struct RewriteStats {
   int candidates = 0;
   int frozen_variables = 0;
   int rewritten_reads = 0;
   int rewritten_gathers = 0;
   int rewritten_gather_nds = 0;
+  int rewritten_varhandle_direct_reads = 0;
+  int rewritten_varhandle_switch_reads = 0;
+  int rewritten_variablev2_reads = 0;
+  int rewritten_variablev2_gathers = 0;
+  int ignored_var_is_initialized = 0;
+  int preserved_assigns = 0;
   int skipped_missing_value = 0;
   int skipped_too_large = 0;
   int skipped_partitioned = 0;
@@ -184,6 +210,15 @@ const Edge* FindDataInputEdge(const Node& node, int dst_input) {
     }
   }
   return nullptr;
+}
+
+std::vector<OutputEdgeSpec> DataOutputs(const Node& node) {
+  std::vector<OutputEdgeSpec> outputs;
+  for (const Edge* edge : node.out_edges()) {
+    if (edge->IsControlEdge()) continue;
+    outputs.push_back({edge->dst(), edge->src_output(), edge->dst_input()});
+  }
+  return outputs;
 }
 
 std::vector<EdgeSpec> ControlInputs(const Node& node) {
@@ -433,6 +468,317 @@ bool IsSafeToFreeze(const Node& node, const FrozenVariable& frozen) {
   return true;
 }
 
+bool IsLookupLikeConsumerOp(absl::string_view op);
+bool HasLookupLikeOutputConsumer(const Node& node);
+
+struct ReadPathAnalysis {
+  int compute_read_paths = 0;
+  int varhandle_direct_reads = 0;
+  int varhandle_switch_reads = 0;
+  int variablev2_reads = 0;
+  int variablev2_gathers = 0;
+  int ignored_var_is_initialized = 0;
+  int preserved_assigns = 0;
+  std::string unsafe_reason;
+};
+
+void SetUnsafeReason(absl::string_view reason, ReadPathAnalysis* analysis) {
+  if (analysis != nullptr && analysis->unsafe_reason.empty()) {
+    analysis->unsafe_reason = std::string(reason);
+  }
+}
+
+bool IsNodeInStack(const std::vector<const Node*>& stack, const Node* node) {
+  return std::find(stack.begin(), stack.end(), node) != stack.end();
+}
+
+bool IsSafeResourceReadLeaf(const Node& consumer,
+                            const FrozenVariable& frozen) {
+  return IsSafeResourceConsumer(consumer, frozen);
+}
+
+bool AnalyzeResourceSwitchChain(const Node& switch_node,
+                                const FrozenVariable& frozen,
+                                std::vector<const Node*>* stack,
+                                ReadPathAnalysis* analysis) {
+  if (switch_node.type_string() != "Switch" ||
+      !AttrTypeEquals(switch_node, "T", DT_RESOURCE)) {
+    SetUnsafeReason(
+        strings::StrCat("unsupported resource switch node ", switch_node.name(),
+                        " op=", switch_node.type_string()),
+        analysis);
+    return false;
+  }
+  if (IsNodeInStack(*stack, &switch_node)) {
+    SetUnsafeReason(strings::StrCat("cycle in resource switch chain at ",
+                                    switch_node.name()),
+                    analysis);
+    return false;
+  }
+
+  stack->push_back(&switch_node);
+  for (const Edge* edge : switch_node.out_edges()) {
+    if (edge->IsControlEdge()) continue;
+
+    Node& consumer = *edge->dst();
+    if (edge->src_output() != 0 && edge->src_output() != 1) {
+      SetUnsafeReason(
+          strings::StrCat("unsupported switch output ", edge->src_output(),
+                          " from ", switch_node.name()),
+          analysis);
+      stack->pop_back();
+      return false;
+    }
+
+    if (consumer.type_string() == "Switch" && edge->dst_input() == 0) {
+      if (!AnalyzeResourceSwitchChain(consumer, frozen, stack, analysis)) {
+        stack->pop_back();
+        return false;
+      }
+      continue;
+    }
+
+    if (edge->dst_input() == 0 && IsSafeResourceReadLeaf(consumer, frozen)) {
+      ++analysis->compute_read_paths;
+      ++analysis->varhandle_switch_reads;
+      continue;
+    }
+
+    SetUnsafeReason(
+        strings::StrCat("unsupported resource switch consumer ",
+                        consumer.name(), " op=", consumer.type_string(),
+                        " input=", edge->dst_input()),
+        analysis);
+    stack->pop_back();
+    return false;
+  }
+  stack->pop_back();
+  return true;
+}
+
+bool AnalyzeVarHandleReadPaths(const Node& node, const FrozenVariable& frozen,
+                               ReadPathAnalysis* analysis) {
+  for (const Edge* edge : node.out_edges()) {
+    if (edge->IsControlEdge()) continue;
+
+    const Node& consumer = *edge->dst();
+    if (consumer.type_string() == "VarIsInitializedOp" &&
+        edge->dst_input() == 0) {
+      ++analysis->ignored_var_is_initialized;
+      continue;
+    }
+    if (consumer.type_string() == "AssignVariableOp" &&
+        edge->dst_input() == 0) {
+      ++analysis->preserved_assigns;
+      continue;
+    }
+
+    if (edge->dst_input() == 0 && IsSafeResourceReadLeaf(consumer, frozen)) {
+      ++analysis->compute_read_paths;
+      ++analysis->varhandle_direct_reads;
+      continue;
+    }
+
+    if (consumer.type_string() == "Switch" && edge->dst_input() == 0) {
+      std::vector<const Node*> stack;
+      if (!AnalyzeResourceSwitchChain(consumer, frozen, &stack, analysis)) {
+        return false;
+      }
+      continue;
+    }
+
+    SetUnsafeReason(
+        strings::StrCat("unsupported VarHandle consumer ", consumer.name(),
+                        " op=", consumer.type_string(),
+                        " input=", edge->dst_input()),
+        analysis);
+    return false;
+  }
+  return true;
+}
+
+bool IsPreservedVariableV2Consumer(const Node& consumer, int dst_input,
+                                   ReadPathAnalysis* analysis) {
+  if (consumer.type_string() == "Assign" && dst_input == 0) {
+    ++analysis->preserved_assigns;
+    return true;
+  }
+  if (consumer.type_string() == "Save" || consumer.type_string() == "SaveV2") {
+    return true;
+  }
+  return false;
+}
+
+bool HasSaveOutputConsumer(const Node& node) {
+  for (const Edge* edge : node.out_edges()) {
+    if (edge->IsControlEdge()) continue;
+    const absl::string_view op = edge->dst()->type_string();
+    if (op == "Save" || op == "SaveV2") return true;
+  }
+  return false;
+}
+
+bool HasSupportedValueOutputConsumers(const Node& node,
+                                      const FrozenVariable& frozen,
+                                      ReadPathAnalysis* analysis) {
+  bool has_output = false;
+  for (const Edge* edge : node.out_edges()) {
+    if (edge->IsControlEdge()) continue;
+    has_output = true;
+
+    const Node& consumer = *edge->dst();
+    if (consumer.type_string() == "Save" ||
+        consumer.type_string() == "SaveV2") {
+      SetUnsafeReason(strings::StrCat("VariableV2 read feeds save path ",
+                                      node.name(), " -> ", consumer.name()),
+                      analysis);
+      return false;
+    }
+    if (IsMutatingVariableOp(consumer.type_string())) {
+      SetUnsafeReason(strings::StrCat("VariableV2 read feeds mutating op ",
+                                      node.name(), " -> ", consumer.name(),
+                                      " op=", consumer.type_string()),
+                      analysis);
+      return false;
+    }
+    if (edge->dst_input() < 0 || edge->dst_input() >= consumer.num_inputs()) {
+      SetUnsafeReason(
+          strings::StrCat("invalid VariableV2 read output input ",
+                          consumer.name(), " op=", consumer.type_string(),
+                          " input=", edge->dst_input()),
+          analysis);
+      return false;
+    }
+    const DataType input_type = consumer.input_type(edge->dst_input());
+    if (IsRefType(input_type) || BaseType(input_type) != frozen.dtype) {
+      SetUnsafeReason(
+          strings::StrCat("unsupported VariableV2 read output type ",
+                          consumer.name(), " op=", consumer.type_string(),
+                          " input=", edge->dst_input(),
+                          " dtype=", DataTypeString(input_type)),
+          analysis);
+      return false;
+    }
+  }
+
+  if (!has_output) {
+    SetUnsafeReason(
+        strings::StrCat("VariableV2 read has no data outputs ", node.name()),
+        analysis);
+    return false;
+  }
+  return true;
+}
+
+bool IsVariableV2ReadIdentity(const Node& consumer, int dst_input,
+                              const FrozenVariable& frozen) {
+  return consumer.type_string() == "Identity" && dst_input == 0 &&
+         AttrTypeEquals(consumer, "T", frozen.dtype);
+}
+
+bool IsSupportedVariableV2ComputeConsumer(const Node& consumer, int dst_input,
+                                          const FrozenVariable& frozen,
+                                          ReadPathAnalysis* analysis) {
+  if (IsVariableV2ReadIdentity(consumer, dst_input, frozen)) {
+    if (!HasSupportedValueOutputConsumers(consumer, frozen, analysis)) {
+      return false;
+    }
+    ++analysis->compute_read_paths;
+    ++analysis->variablev2_reads;
+    if (HasLookupLikeOutputConsumer(consumer)) {
+      ++analysis->variablev2_gathers;
+    }
+    return true;
+  }
+
+  if (HasSaveOutputConsumer(consumer)) {
+    SetUnsafeReason(
+        strings::StrCat("VariableV2 read feeds save path ", consumer.name(),
+                        " op=", consumer.type_string()),
+        analysis);
+    return false;
+  }
+
+  if (dst_input < 0 || dst_input >= consumer.num_inputs()) {
+    SetUnsafeReason(
+        strings::StrCat("invalid VariableV2 consumer input ", consumer.name(),
+                        " op=", consumer.type_string(), " input=", dst_input),
+        analysis);
+    return false;
+  }
+
+  const DataType input_type = consumer.input_type(dst_input);
+  if (IsRefType(input_type) || BaseType(input_type) != frozen.dtype) {
+    SetUnsafeReason(
+        strings::StrCat("unsupported VariableV2 consumer type ",
+                        consumer.name(), " op=", consumer.type_string(),
+                        " input=", dst_input,
+                        " dtype=", DataTypeString(input_type)),
+        analysis);
+    return false;
+  }
+
+  ++analysis->compute_read_paths;
+  ++analysis->variablev2_reads;
+  if (IsLookupLikeConsumerOp(consumer.type_string())) {
+    ++analysis->variablev2_gathers;
+  }
+  return true;
+}
+
+bool AnalyzeVariableV2ReadPaths(const Node& node, const FrozenVariable& frozen,
+                                ReadPathAnalysis* analysis) {
+  for (const Edge* edge : node.out_edges()) {
+    if (edge->IsControlEdge()) continue;
+
+    const Node& consumer = *edge->dst();
+    if (IsPreservedVariableV2Consumer(consumer, edge->dst_input(), analysis)) {
+      continue;
+    }
+    if (IsMutatingVariableOp(consumer.type_string())) {
+      SetUnsafeReason(
+          strings::StrCat("unsupported mutating VariableV2 consumer ",
+                          consumer.name(), " op=", consumer.type_string(),
+                          " input=", edge->dst_input()),
+          analysis);
+      return false;
+    }
+    if (!IsSupportedVariableV2ComputeConsumer(consumer, edge->dst_input(),
+                                              frozen, analysis)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool IsSafeToReadPathFreeze(const Node& node, const FrozenVariable& frozen,
+                            ReadPathAnalysis* analysis) {
+  if (!IsFrozenValueCompatibleWithNode(node, frozen)) {
+    SetUnsafeReason("checkpoint tensor is incompatible with variable node",
+                    analysis);
+    return false;
+  }
+
+  bool safe = false;
+  if (node.type_string() == "VarHandleOp") {
+    safe = AnalyzeVarHandleReadPaths(node, frozen, analysis);
+  } else if (node.type_string() == "VariableV2") {
+    safe = AnalyzeVariableV2ReadPaths(node, frozen, analysis);
+  } else {
+    SetUnsafeReason(
+        strings::StrCat("unsupported variable op ", node.type_string()),
+        analysis);
+    return false;
+  }
+
+  if (!safe) return false;
+  if (analysis->compute_read_paths == 0) {
+    SetUnsafeReason("no supported compute read path", analysis);
+    return false;
+  }
+  return true;
+}
+
 bool IsFloatingPointDType(DataType dtype) {
   return dtype == DT_FLOAT || dtype == DT_HALF || dtype == DT_BFLOAT16 ||
          dtype == DT_DOUBLE;
@@ -449,8 +795,7 @@ bool HasPartSuffix(absl::string_view value, size_t part_pos) {
 
 std::string NormalizePolicyIdentifier(absl::string_view value) {
   std::string normalized = ToLower(value);
-  constexpr absl::string_view kAttributeSuffix =
-      "/.attributes/variable_value";
+  constexpr absl::string_view kAttributeSuffix = "/.attributes/variable_value";
   if (absl::EndsWith(normalized, kAttributeSuffix)) {
     normalized.resize(normalized.size() - kAttributeSuffix.size());
   }
@@ -473,8 +818,7 @@ bool HasValuableParameterName(absl::string_view raw_name) {
          absl::EndsWith(name, "/scale") || name == "scale" ||
          absl::EndsWith(name, "/offset") || name == "offset" ||
          absl::EndsWith(name, "/moving_mean") || name == "moving_mean" ||
-         absl::EndsWith(name, "/moving_variance") ||
-         name == "moving_variance";
+         absl::EndsWith(name, "/moving_variance") || name == "moving_variance";
 }
 
 bool HasLookupLikeName(absl::string_view raw_name) {
@@ -486,16 +830,15 @@ bool HasLookupLikeName(absl::string_view raw_name) {
 }
 
 bool IsLookupLikeConsumerOp(absl::string_view op) {
-  return op == "ResourceGather" || op == "ResourceGatherNd" ||
-         op == "Gather" || op == "GatherV2" || op == "GatherNd" ||
+  return op == "ResourceGather" || op == "ResourceGatherNd" || op == "Gather" ||
+         op == "GatherV2" || op == "GatherNd" ||
          Contains(ToLower(op), "lookup");
 }
 
 bool IsDenseLikeConsumerOp(absl::string_view op) {
   return op == "MatMul" || op == "BatchMatMul" || op == "BatchMatMulV2" ||
-         op == "Conv2D" || op == "DepthwiseConv2dNative" ||
-         op == "BiasAdd" || op == "FusedBatchNorm" ||
-         op == "FusedBatchNormV3";
+         op == "Conv2D" || op == "DepthwiseConv2dNative" || op == "BiasAdd" ||
+         op == "FusedBatchNorm" || op == "FusedBatchNormV3";
 }
 
 bool HasConsumerMatching(const Node& node,
@@ -591,19 +934,70 @@ NodeDef ConstNodeDef(const Node& node, const FrozenVariable& frozen) {
   return node_def;
 }
 
-absl::Status RewriteReadVariable(Graph* graph, Node* node,
-                                 const FrozenVariable& frozen) {
-  const Edge* value_edge = FindDataInputEdge(*node, 0);
-  if (value_edge == nullptr) return absl::OkStatus();
+NodeDef FrozenConstNodeDef(Graph* graph, const Node& node,
+                           const FrozenVariable& frozen) {
+  NodeDef node_def;
+  node_def.set_name(
+      graph->NewName(strings::StrCat(node.name(), "/frozen_const")));
+  node_def.set_op("Const");
+  node_def.set_device(node.requested_device());
+  CopyInternalAttrs(node.def(), &node_def);
+  AddNodeAttr("dtype", frozen.dtype, &node_def);
+  AddNodeAttr("value", frozen.value, &node_def);
+  for (const EdgeSpec& edge : ControlInputs(node)) {
+    AddInputToNodeDef(edge, &node_def);
+  }
+  return node_def;
+}
 
+absl::Status GetOrCreateFrozenConst(
+    Graph* graph, Node* variable, const FrozenVariable& frozen,
+    absl::flat_hash_map<std::string, Node*>* frozen_const_by_node_name,
+    Node** const_node) {
+  auto it = frozen_const_by_node_name->find(variable->name());
+  if (it != frozen_const_by_node_name->end()) {
+    *const_node = it->second;
+    return absl::OkStatus();
+  }
+
+  const std::vector<EdgeSpec> control_inputs = ControlInputs(*variable);
+  NodeDef node_def = FrozenConstNodeDef(graph, *variable, frozen);
+
+  absl::Status status;
+  Node* new_node = graph->AddNode(std::move(node_def), &status);
+  if (!status.ok()) return status;
+  if (!variable->assigned_device_name().empty()) {
+    new_node->set_assigned_device_name(variable->assigned_device_name());
+  }
+  for (const EdgeSpec& edge : control_inputs) {
+    graph->AddEdge(edge.src, edge.src_output, new_node, edge.dst_input);
+  }
+
+  (*frozen_const_by_node_name)[variable->name()] = new_node;
+  *const_node = new_node;
+  return absl::OkStatus();
+}
+
+absl::Status RewriteReadVariableFromSource(Graph* graph, Node* node,
+                                           Node* value_src,
+                                           int value_src_output,
+                                           const FrozenVariable& frozen) {
   std::vector<EdgeSpec> inputs;
-  inputs.push_back({value_edge->src(), value_edge->src_output(), 0});
+  inputs.push_back({value_src, value_src_output, 0});
   for (const EdgeSpec& edge : ControlInputs(*node)) inputs.push_back(edge);
 
   NodeDef node_def = BaseReplacementDef(*node, "Identity");
   for (const EdgeSpec& edge : inputs) AddInputToNodeDef(edge, &node_def);
   AddNodeAttr("T", frozen.dtype, &node_def);
   return ReplaceNode(graph, node, std::move(node_def), inputs);
+}
+
+absl::Status RewriteReadVariable(Graph* graph, Node* node,
+                                 const FrozenVariable& frozen) {
+  const Edge* value_edge = FindDataInputEdge(*node, 0);
+  if (value_edge == nullptr) return absl::OkStatus();
+  return RewriteReadVariableFromSource(graph, node, value_edge->src(),
+                                       value_edge->src_output(), frozen);
 }
 
 absl::Status MakeAxisConst(Graph* graph, const Node& gather_node,
@@ -639,12 +1033,12 @@ absl::Status MakeAxisConst(Graph* graph, const Node& gather_node,
   return absl::OkStatus();
 }
 
-absl::Status RewriteResourceGather(Graph* graph, Node* node,
-                                   const FrozenVariable& frozen) {
-  const Edge* params_edge = FindDataInputEdge(*node, 0);
+absl::Status RewriteResourceGatherFromSource(Graph* graph, Node* node,
+                                             Node* params_src,
+                                             int params_src_output,
+                                             const FrozenVariable& frozen) {
   const Edge* indices_edge = FindDataInputEdge(*node, 1);
-  if (params_edge == nullptr || indices_edge == nullptr)
-    return absl::OkStatus();
+  if (indices_edge == nullptr) return absl::OkStatus();
 
   DataType indices_dtype = DT_INVALID;
   if (!GetNodeAttr(node->def(), "Tindices", &indices_dtype).ok()) {
@@ -656,7 +1050,7 @@ absl::Status RewriteResourceGather(Graph* graph, Node* node,
   if (!status.ok()) return status;
 
   std::vector<EdgeSpec> inputs;
-  inputs.push_back({params_edge->src(), params_edge->src_output(), 0});
+  inputs.push_back({params_src, params_src_output, 0});
   inputs.push_back({indices_edge->src(), indices_edge->src_output(), 1});
   inputs.push_back({axis_node, 0, 2});
   for (const EdgeSpec& edge : ControlInputs(*node)) inputs.push_back(edge);
@@ -670,12 +1064,20 @@ absl::Status RewriteResourceGather(Graph* graph, Node* node,
   return ReplaceNode(graph, node, std::move(node_def), inputs);
 }
 
-absl::Status RewriteResourceGatherNd(Graph* graph, Node* node,
-                                     const FrozenVariable& frozen) {
+absl::Status RewriteResourceGather(Graph* graph, Node* node,
+                                   const FrozenVariable& frozen) {
   const Edge* params_edge = FindDataInputEdge(*node, 0);
+  if (params_edge == nullptr) return absl::OkStatus();
+  return RewriteResourceGatherFromSource(graph, node, params_edge->src(),
+                                         params_edge->src_output(), frozen);
+}
+
+absl::Status RewriteResourceGatherNdFromSource(Graph* graph, Node* node,
+                                               Node* params_src,
+                                               int params_src_output,
+                                               const FrozenVariable& frozen) {
   const Edge* indices_edge = FindDataInputEdge(*node, 1);
-  if (params_edge == nullptr || indices_edge == nullptr)
-    return absl::OkStatus();
+  if (indices_edge == nullptr) return absl::OkStatus();
 
   DataType indices_dtype = DT_INVALID;
   if (!GetNodeAttr(node->def(), "Tindices", &indices_dtype).ok()) {
@@ -683,7 +1085,7 @@ absl::Status RewriteResourceGatherNd(Graph* graph, Node* node,
   }
 
   std::vector<EdgeSpec> inputs;
-  inputs.push_back({params_edge->src(), params_edge->src_output(), 0});
+  inputs.push_back({params_src, params_src_output, 0});
   inputs.push_back({indices_edge->src(), indices_edge->src_output(), 1});
   for (const EdgeSpec& edge : ControlInputs(*node)) inputs.push_back(edge);
 
@@ -692,6 +1094,224 @@ absl::Status RewriteResourceGatherNd(Graph* graph, Node* node,
   AddNodeAttr("Tparams", frozen.dtype, &node_def);
   AddNodeAttr("Tindices", indices_dtype, &node_def);
   return ReplaceNode(graph, node, std::move(node_def), inputs);
+}
+
+absl::Status RewriteResourceGatherNd(Graph* graph, Node* node,
+                                     const FrozenVariable& frozen) {
+  const Edge* params_edge = FindDataInputEdge(*node, 0);
+  if (params_edge == nullptr) return absl::OkStatus();
+  return RewriteResourceGatherNdFromSource(graph, node, params_edge->src(),
+                                           params_edge->src_output(), frozen);
+}
+
+absl::Status GetOrCreateMirrorSwitch(
+    Graph* graph, Node* resource_switch, Node* data_src, int data_src_output,
+    const FrozenVariable& frozen,
+    absl::flat_hash_map<Node*, Node*>* mirror_switches, Node** mirror_switch) {
+  auto it = mirror_switches->find(resource_switch);
+  if (it != mirror_switches->end()) {
+    *mirror_switch = it->second;
+    return absl::OkStatus();
+  }
+
+  const Edge* pred_edge = FindDataInputEdge(*resource_switch, 1);
+  if (pred_edge == nullptr) {
+    return errors::InvalidArgument("Switch missing pred input: ",
+                                   resource_switch->name());
+  }
+
+  std::vector<EdgeSpec> inputs;
+  inputs.push_back({data_src, data_src_output, 0});
+  inputs.push_back({pred_edge->src(), pred_edge->src_output(), 1});
+  for (const EdgeSpec& edge : ControlInputs(*resource_switch)) {
+    inputs.push_back(edge);
+  }
+
+  NodeDef node_def;
+  node_def.set_name(graph->NewName(
+      strings::StrCat(resource_switch->name(), "/frozen_switch")));
+  node_def.set_op("Switch");
+  node_def.set_device(resource_switch->requested_device());
+  CopyInternalAttrs(resource_switch->def(), &node_def);
+  for (const EdgeSpec& edge : inputs) AddInputToNodeDef(edge, &node_def);
+  AddNodeAttr("T", frozen.dtype, &node_def);
+
+  absl::Status status;
+  Node* new_node = graph->AddNode(std::move(node_def), &status);
+  if (!status.ok()) return status;
+  if (!resource_switch->assigned_device_name().empty()) {
+    new_node->set_assigned_device_name(resource_switch->assigned_device_name());
+  }
+  for (const EdgeSpec& edge : inputs) {
+    graph->AddEdge(edge.src, edge.src_output, new_node, edge.dst_input);
+  }
+
+  (*mirror_switches)[resource_switch] = new_node;
+  *mirror_switch = new_node;
+  return absl::OkStatus();
+}
+
+absl::Status RewriteResourceSwitchChain(
+    Graph* graph, Node* resource_switch, Node* data_src, int data_src_output,
+    const FrozenVariable& frozen,
+    absl::flat_hash_map<Node*, Node*>* mirror_switches, RewriteStats* stats,
+    int* rewritten_paths) {
+  Node* mirror_switch = nullptr;
+  TF_RETURN_IF_ERROR(GetOrCreateMirrorSwitch(graph, resource_switch, data_src,
+                                             data_src_output, frozen,
+                                             mirror_switches, &mirror_switch));
+
+  const std::vector<OutputEdgeSpec> outputs = DataOutputs(*resource_switch);
+  for (const OutputEdgeSpec& output : outputs) {
+    Node* consumer = output.dst;
+    if (consumer->type_string() == "Switch" && output.dst_input == 0) {
+      TF_RETURN_IF_ERROR(RewriteResourceSwitchChain(
+          graph, consumer, mirror_switch, output.src_output, frozen,
+          mirror_switches, stats, rewritten_paths));
+      continue;
+    }
+
+    if (consumer->type_string() == "ReadVariableOp" && output.dst_input == 0) {
+      TF_RETURN_IF_ERROR(RewriteReadVariableFromSource(
+          graph, consumer, mirror_switch, output.src_output, frozen));
+      ++stats->rewritten_reads;
+      ++stats->rewritten_varhandle_switch_reads;
+      ++*rewritten_paths;
+      continue;
+    }
+
+    if (consumer->type_string() == "ResourceGather" && output.dst_input == 0) {
+      TF_RETURN_IF_ERROR(RewriteResourceGatherFromSource(
+          graph, consumer, mirror_switch, output.src_output, frozen));
+      ++stats->rewritten_gathers;
+      ++stats->rewritten_varhandle_switch_reads;
+      ++*rewritten_paths;
+      continue;
+    }
+
+    if (consumer->type_string() == "ResourceGatherNd" &&
+        output.dst_input == 0) {
+      TF_RETURN_IF_ERROR(RewriteResourceGatherNdFromSource(
+          graph, consumer, mirror_switch, output.src_output, frozen));
+      ++stats->rewritten_gather_nds;
+      ++stats->rewritten_varhandle_switch_reads;
+      ++*rewritten_paths;
+      continue;
+    }
+  }
+  return absl::OkStatus();
+}
+
+absl::Status RewriteVarHandleReadPaths(
+    Graph* graph, Node* variable, Node* frozen_const,
+    const FrozenVariable& frozen,
+    absl::flat_hash_map<Node*, Node*>* mirror_switches, RewriteStats* stats,
+    int* rewritten_paths) {
+  const std::vector<OutputEdgeSpec> outputs = DataOutputs(*variable);
+  for (const OutputEdgeSpec& output : outputs) {
+    Node* consumer = output.dst;
+    if (consumer->type_string() == "ReadVariableOp" && output.dst_input == 0) {
+      TF_RETURN_IF_ERROR(RewriteReadVariableFromSource(
+          graph, consumer, frozen_const, 0, frozen));
+      ++stats->rewritten_reads;
+      ++stats->rewritten_varhandle_direct_reads;
+      ++*rewritten_paths;
+      continue;
+    }
+    if (consumer->type_string() == "ResourceGather" && output.dst_input == 0) {
+      TF_RETURN_IF_ERROR(RewriteResourceGatherFromSource(
+          graph, consumer, frozen_const, 0, frozen));
+      ++stats->rewritten_gathers;
+      ++stats->rewritten_varhandle_direct_reads;
+      ++*rewritten_paths;
+      continue;
+    }
+    if (consumer->type_string() == "ResourceGatherNd" &&
+        output.dst_input == 0) {
+      TF_RETURN_IF_ERROR(RewriteResourceGatherNdFromSource(
+          graph, consumer, frozen_const, 0, frozen));
+      ++stats->rewritten_gather_nds;
+      ++stats->rewritten_varhandle_direct_reads;
+      ++*rewritten_paths;
+      continue;
+    }
+    if (consumer->type_string() == "Switch" && output.dst_input == 0) {
+      TF_RETURN_IF_ERROR(
+          RewriteResourceSwitchChain(graph, consumer, frozen_const, 0, frozen,
+                                     mirror_switches, stats, rewritten_paths));
+      continue;
+    }
+  }
+  return absl::OkStatus();
+}
+
+bool HasLookupLikeOutputConsumer(const Node& node) {
+  for (const Edge* edge : node.out_edges()) {
+    if (edge->IsControlEdge()) continue;
+    if (IsLookupLikeConsumerOp(edge->dst()->type_string())) return true;
+  }
+  return false;
+}
+
+absl::Status RewriteVariableV2ReadPaths(Graph* graph, Node* variable,
+                                        Node* frozen_const,
+                                        const FrozenVariable& frozen,
+                                        RewriteStats* stats,
+                                        int* rewritten_paths) {
+  const std::vector<OutputEdgeSpec> outputs = DataOutputs(*variable);
+  for (const OutputEdgeSpec& output : outputs) {
+    Node* consumer = output.dst;
+    ReadPathAnalysis unused_analysis;
+    if (IsPreservedVariableV2Consumer(*consumer, output.dst_input,
+                                      &unused_analysis) ||
+        IsMutatingVariableOp(consumer->type_string())) {
+      continue;
+    }
+    if (IsVariableV2ReadIdentity(*consumer, output.dst_input, frozen)) {
+      const bool has_lookup_output = HasLookupLikeOutputConsumer(*consumer);
+      TF_RETURN_IF_ERROR(RewriteReadVariableFromSource(
+          graph, consumer, frozen_const, 0, frozen));
+      ++stats->rewritten_variablev2_reads;
+      if (has_lookup_output) ++stats->rewritten_variablev2_gathers;
+      ++*rewritten_paths;
+      continue;
+    }
+    if (output.dst_input < 0 || output.dst_input >= consumer->num_inputs() ||
+        IsRefType(consumer->input_type(output.dst_input)) ||
+        BaseType(consumer->input_type(output.dst_input)) != frozen.dtype) {
+      continue;
+    }
+
+    TF_RETURN_IF_ERROR(
+        graph->UpdateEdge(frozen_const, 0, consumer, output.dst_input));
+    ++stats->rewritten_variablev2_reads;
+    if (IsLookupLikeConsumerOp(consumer->type_string()) ||
+        HasLookupLikeOutputConsumer(*consumer)) {
+      ++stats->rewritten_variablev2_gathers;
+    }
+    ++*rewritten_paths;
+  }
+  return absl::OkStatus();
+}
+
+absl::Status RewriteReadPaths(
+    Graph* graph, Node* variable, const FrozenVariable& frozen,
+    absl::flat_hash_map<std::string, Node*>* frozen_const_by_node_name,
+    RewriteStats* stats, int* rewritten_paths) {
+  Node* frozen_const = nullptr;
+  TF_RETURN_IF_ERROR(GetOrCreateFrozenConst(
+      graph, variable, frozen, frozen_const_by_node_name, &frozen_const));
+
+  if (variable->type_string() == "VarHandleOp") {
+    absl::flat_hash_map<Node*, Node*> mirror_switches;
+    return RewriteVarHandleReadPaths(graph, variable, frozen_const, frozen,
+                                     &mirror_switches, stats, rewritten_paths);
+  }
+  if (variable->type_string() == "VariableV2") {
+    return RewriteVariableV2ReadPaths(graph, variable, frozen_const, frozen,
+                                      stats, rewritten_paths);
+  }
+  return absl::OkStatus();
 }
 
 }  // namespace
@@ -720,9 +1340,11 @@ absl::Status FreezeReadonlyVariablesPass::Run(
 
   RewriteStats stats;
   const FreezePolicy freeze_policy = FreezePolicyFromEnv();
+  const bool read_path_freeze = EnvFlagEnabled(kReadPathFreezeEnvVar);
   const int64_t parameter_max_bytes = ParameterMaxBytes();
   absl::flat_hash_map<std::string, FrozenVariable> frozen_by_node_name;
   std::vector<std::pair<Node*, FrozenVariable>> variables_to_replace;
+  std::vector<std::pair<Node*, FrozenVariable>> variables_to_rewrite_read_paths;
 
   std::vector<Node*> nodes;
   for (Node* node : graph->op_nodes()) nodes.push_back(node);
@@ -757,11 +1379,21 @@ absl::Status FreezeReadonlyVariablesPass::Run(
       continue;
     }
 
-    if (!IsSafeToFreeze(*node, frozen)) {
+    const bool safe_to_replace = IsSafeToFreeze(*node, frozen);
+    ReadPathAnalysis read_path_analysis;
+    const bool safe_to_rewrite_read_path =
+        read_path_freeze && !safe_to_replace &&
+        IsSafeToReadPathFreeze(*node, frozen, &read_path_analysis);
+
+    if (!safe_to_replace && !safe_to_rewrite_read_path) {
       ++stats.skipped_unsafe;
       VLOG(1) << "FreezeReadonlyVariablesPass: skip unsafe variable "
               << node->name() << " from checkpoint key "
-              << frozen.checkpoint_key;
+              << frozen.checkpoint_key
+              << (read_path_analysis.unsafe_reason.empty()
+                      ? ""
+                      : strings::StrCat(" reason=",
+                                        read_path_analysis.unsafe_reason));
       continue;
     }
 
@@ -771,8 +1403,7 @@ absl::Status FreezeReadonlyVariablesPass::Run(
                                      &skip_reason)) {
         ++stats.skipped_policy;
         VLOG(1) << "FreezeReadonlyVariablesPass: skip by policy node="
-                << node->name()
-                << " shared_name=" << OptionalSharedName(*node)
+                << node->name() << " shared_name=" << OptionalSharedName(*node)
                 << " checkpoint_key=" << frozen.checkpoint_key
                 << " reason=" << skip_reason
                 << " estimated_bytes=" << frozen.estimated_bytes
@@ -781,8 +1412,15 @@ absl::Status FreezeReadonlyVariablesPass::Run(
       }
     }
 
-    frozen_by_node_name[node->name()] = frozen;
-    variables_to_replace.push_back({node, frozen});
+    if (safe_to_replace) {
+      frozen_by_node_name[node->name()] = frozen;
+      variables_to_replace.push_back({node, frozen});
+    } else {
+      variables_to_rewrite_read_paths.push_back({node, frozen});
+      stats.ignored_var_is_initialized +=
+          read_path_analysis.ignored_var_is_initialized;
+      stats.preserved_assigns += read_path_analysis.preserved_assigns;
+    }
   }
 
   for (const auto& entry : variables_to_replace) {
@@ -835,19 +1473,58 @@ absl::Status FreezeReadonlyVariablesPass::Run(
     }
   }
 
+  if (read_path_freeze) {
+    absl::flat_hash_map<std::string, Node*> frozen_const_by_node_name;
+    for (const auto& entry : variables_to_rewrite_read_paths) {
+      Node* node = entry.first;
+      const FrozenVariable& frozen = entry.second;
+      LOG(INFO) << "FreezeReadonlyVariablesPass read-path freezing node="
+                << node->name() << " op=" << node->type_string()
+                << " shared_name=" << OptionalSharedName(*node)
+                << " checkpoint_key=" << frozen.checkpoint_key
+                << " estimated_bytes=" << frozen.estimated_bytes
+                << " dtype=" << DataTypeString(frozen.dtype);
+      int rewritten_paths = 0;
+      absl::Status status =
+          RewriteReadPaths(graph, node, frozen, &frozen_const_by_node_name,
+                           &stats, &rewritten_paths);
+      if (!status.ok()) return status;
+      if (rewritten_paths > 0) {
+        ++stats.frozen_variables;
+      } else {
+        ++stats.skipped_unsupported;
+        VLOG(1) << "FreezeReadonlyVariablesPass: no read paths rewritten for "
+                << node->name() << " checkpoint_key=" << frozen.checkpoint_key;
+      }
+    }
+  }
+
   LOG(INFO) << "FreezeReadonlyVariablesPass checkpoint=" << checkpoint_prefix
             << " policy=" << FreezePolicyName(freeze_policy)
+            << " read_path_freeze=" << read_path_freeze
             << " parameter_max_bytes=" << parameter_max_bytes
             << " candidates=" << stats.candidates
             << " frozen_variables=" << stats.frozen_variables
             << " rewritten_reads=" << stats.rewritten_reads
             << " rewritten_gathers=" << stats.rewritten_gathers
             << " rewritten_gather_nds=" << stats.rewritten_gather_nds
+            << " rewritten_varhandle_direct_reads="
+            << stats.rewritten_varhandle_direct_reads
+            << " rewritten_varhandle_switch_reads="
+            << stats.rewritten_varhandle_switch_reads
+            << " rewritten_variablev2_reads="
+            << stats.rewritten_variablev2_reads
+            << " rewritten_variablev2_gathers="
+            << stats.rewritten_variablev2_gathers
+            << " ignored_var_is_initialized="
+            << stats.ignored_var_is_initialized
+            << " preserved_assigns=" << stats.preserved_assigns
             << " skipped_missing_value=" << stats.skipped_missing_value
             << " skipped_too_large=" << stats.skipped_too_large
             << " skipped_partitioned=" << stats.skipped_partitioned
             << " skipped_unsafe=" << stats.skipped_unsafe
-            << " skipped_policy=" << stats.skipped_policy;
+            << " skipped_policy=" << stats.skipped_policy
+            << " skipped_unsupported=" << stats.skipped_unsupported;
 
   // const std::string after_dump = DumpGraphToFile(
   //     "after_freeze_readonly_variables_pass", *graph, options.flib_def);
