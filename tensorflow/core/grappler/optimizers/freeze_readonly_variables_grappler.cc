@@ -1,14 +1,5 @@
 #include "tensorflow/core/grappler/optimizers/freeze_readonly_variables_grappler.h"
 
-#include <cctype>
-#include <cstdlib>
-#include <cstring>
-#include <functional>
-#include <limits>
-#include <string>
-#include <utility>
-#include <vector>
-
 #include "absl/container/flat_hash_map.h"
 #include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
@@ -43,18 +34,7 @@ namespace {
 constexpr char kGrapplerCheckpointEnvVar[] =
     "TF_XLA_FREEZE_VARIABLES_GRAPPLER_CHECKPOINT";
 constexpr char kMaxTensorBytesEnvVar[] = "TF_XLA_FREEZE_VARIABLES_MAX_BYTES";
-constexpr char kFreezePolicyEnvVar[] = "TF_XLA_FREEZE_VARIABLES_POLICY";
-constexpr char kReadPathFreezeEnvVar[] =
-    "TF_XLA_FREEZE_READONLY_VARIABLES_READ_PATH";
-constexpr char kParameterMaxBytesEnvVar[] =
-    "TF_XLA_FREEZE_VARIABLES_PARAMETER_MAX_BYTES";
-constexpr int64_t kDefaultMaxTensorBytes = 16LL * 1024 * 1024;
-constexpr int64_t kDefaultParameterMaxBytes = 4LL * 1024 * 1024;
-
-enum class FreezePolicy {
-  kValuableParameters,
-  kAllSafe,
-};
+constexpr int64_t kDefaultMaxTensorBytes = 1LL * 1024 * 1024; // Set default to 1 MiB to avoid OOM when accidentally freezing large variables.
 
 struct FrozenVariable {
   std::string checkpoint_key;
@@ -80,7 +60,6 @@ struct RewriteStats {
   int skipped_too_large = 0;
   int skipped_partitioned = 0;
   int skipped_unsafe = 0;
-  int skipped_policy = 0;
   int skipped_unsupported = 0;
 };
 
@@ -96,46 +75,6 @@ bool Contains(absl::string_view value, absl::string_view needle) {
   return value.find(needle) != absl::string_view::npos;
 }
 
-FreezePolicy FreezePolicyFromEnv() {
-  const char* value = std::getenv(kFreezePolicyEnvVar);
-  if (value == nullptr || value[0] == '\0') {
-    return FreezePolicy::kValuableParameters;
-  }
-
-  const std::string policy = ToLower(value);
-  if (policy == "all_safe" || policy == "all" || policy == "legacy") {
-    return FreezePolicy::kAllSafe;
-  }
-  if (policy == "valuable_parameters" || policy == "valuable" ||
-      policy == "parameters") {
-    return FreezePolicy::kValuableParameters;
-  }
-
-  LOG(WARNING) << "Ignoring invalid " << kFreezePolicyEnvVar << "=" << value
-               << "; using valuable_parameters";
-  return FreezePolicy::kValuableParameters;
-}
-
-absl::string_view FreezePolicyName(FreezePolicy policy) {
-  switch (policy) {
-    case FreezePolicy::kAllSafe:
-      return "all_safe";
-    case FreezePolicy::kValuableParameters:
-      return "valuable_parameters";
-  }
-  return "valuable_parameters";
-}
-
-bool EnvFlagEnabled(absl::string_view env_var) {
-  const std::string env_var_name(env_var);
-  const char* value = std::getenv(env_var_name.c_str());
-  if (value == nullptr || value[0] == '\0') return false;
-
-  const std::string normalized = ToLower(value);
-  return normalized == "1" || normalized == "true" || normalized == "yes" ||
-         normalized == "on";
-}
-
 int64_t MaxTensorBytes() {
   const char* value = std::getenv(kMaxTensorBytesEnvVar);
   if (value == nullptr || value[0] == '\0') return kDefaultMaxTensorBytes;
@@ -145,21 +84,6 @@ int64_t MaxTensorBytes() {
     LOG(WARNING) << "Ignoring invalid " << kMaxTensorBytesEnvVar << "=" << value
                  << "; using " << kDefaultMaxTensorBytes;
     return kDefaultMaxTensorBytes;
-  }
-  return parsed;
-}
-
-int64_t ParameterMaxBytes() {
-  const char* value = std::getenv(kParameterMaxBytesEnvVar);
-  if (value == nullptr || value[0] == '\0') {
-    return kDefaultParameterMaxBytes;
-  }
-
-  int64_t parsed = 0;
-  if (!absl::SimpleAtoi(value, &parsed) || parsed < 0) {
-    LOG(WARNING) << "Ignoring invalid " << kParameterMaxBytesEnvVar << "="
-                 << value << "; using " << kDefaultParameterMaxBytes;
-    return kDefaultParameterMaxBytes;
   }
   return parsed;
 }
@@ -935,150 +859,10 @@ bool IsSafeToReadPathFreeze(const GraphDef& graph, const Fanouts& fanouts,
   return true;
 }
 
-bool IsFloatingPointDType(DataType dtype) {
-  return dtype == DT_FLOAT || dtype == DT_HALF || dtype == DT_BFLOAT16 ||
-         dtype == DT_DOUBLE;
-}
-
-std::string NormalizePolicyIdentifier(absl::string_view value) {
-  std::string normalized = ToLower(value);
-  constexpr absl::string_view kAttributeSuffix = "/.attributes/variable_value";
-  if (absl::EndsWith(normalized, kAttributeSuffix)) {
-    normalized.resize(normalized.size() - kAttributeSuffix.size());
-  }
-
-  const size_t part_pos = normalized.rfind("/part_");
-  if (part_pos != std::string::npos && HasPartSuffix(normalized, part_pos)) {
-    normalized.resize(part_pos);
-  }
-  return normalized;
-}
-
-bool HasValuableParameterName(absl::string_view raw_name) {
-  const std::string name = NormalizePolicyIdentifier(raw_name);
-  return absl::EndsWith(name, "/bias") || name == "bias" ||
-         absl::EndsWith(name, "/kernel") || name == "kernel" ||
-         absl::EndsWith(name, "/weight") || name == "weight" ||
-         absl::EndsWith(name, "/weights") || name == "weights" ||
-         absl::EndsWith(name, "/gamma") || name == "gamma" ||
-         absl::EndsWith(name, "/beta") || name == "beta" ||
-         absl::EndsWith(name, "/scale") || name == "scale" ||
-         absl::EndsWith(name, "/offset") || name == "offset" ||
-         absl::EndsWith(name, "/moving_mean") || name == "moving_mean" ||
-         absl::EndsWith(name, "/moving_variance") || name == "moving_variance";
-}
-
-bool HasLookupLikeName(absl::string_view raw_name) {
-  const std::string name = NormalizePolicyIdentifier(raw_name);
-  return Contains(name, "embedding") || Contains(name, "emb_lookup") ||
-         Contains(name, "lookup") || Contains(name, "sparse_features") ||
-         Contains(name, "vocab") || Contains(name, "table") ||
-         Contains(name, "hash") || Contains(name, "padding_session");
-}
-
 bool IsLookupLikeConsumerOp(absl::string_view op) {
   return op == "ResourceGather" || op == "ResourceGatherNd" || op == "Gather" ||
          op == "GatherV2" || op == "GatherNd" ||
          Contains(ToLower(op), "lookup");
-}
-
-bool IsDenseLikeConsumerOp(absl::string_view op) {
-  return op == "MatMul" || op == "BatchMatMul" || op == "BatchMatMulV2" ||
-         op == "Conv2D" || op == "DepthwiseConv2dNative" || op == "BiasAdd" ||
-         op == "FusedBatchNorm" || op == "FusedBatchNormV3";
-}
-
-bool HasConsumerMatching(const GraphDef& graph, const Fanouts& fanouts,
-                         const NodeDef& node,
-                         bool (*predicate)(absl::string_view)) {
-  const auto fanout_it = fanouts.find(node.name());
-  if (fanout_it == fanouts.end()) return false;
-
-  for (const std::string& consumer_name : fanout_it->second) {
-    const NodeDef* consumer = FindNode(graph, consumer_name);
-    if (consumer == nullptr) continue;
-    if (predicate(consumer->op())) return true;
-
-    if (consumer->op() != "ReadVariableOp") continue;
-    const auto read_fanout_it = fanouts.find(consumer->name());
-    if (read_fanout_it == fanouts.end()) continue;
-    for (const std::string& read_consumer_name : read_fanout_it->second) {
-      const NodeDef* read_consumer = FindNode(graph, read_consumer_name);
-      if (read_consumer != nullptr && predicate(read_consumer->op())) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-bool HasLookupLikeConsumer(const GraphDef& graph, const Fanouts& fanouts,
-                           const NodeDef& node) {
-  return HasConsumerMatching(graph, fanouts, node, IsLookupLikeConsumerOp);
-}
-
-bool HasDenseLikeConsumer(const GraphDef& graph, const Fanouts& fanouts,
-                          const NodeDef& node) {
-  return HasConsumerMatching(graph, fanouts, node, IsDenseLikeConsumerOp);
-}
-
-bool LooksLikeLookupTableShape(const FrozenVariable& frozen) {
-  const TensorShapeProto& shape = frozen.value.tensor_shape();
-  if (shape.dim_size() < 2) return false;
-
-  const int64_t rows = shape.dim(0).size();
-  const int64_t width = shape.dim(shape.dim_size() - 1).size();
-  if (rows < 0 || width < 0) return false;
-  return (rows >= 4096 && width <= 64) || (rows >= 10000 && width <= 256);
-}
-
-bool HasValuablePolicyName(const NodeDef& node, const FrozenVariable& frozen) {
-  if (HasValuableParameterName(frozen.checkpoint_key)) return true;
-  if (HasValuableParameterName(node.name())) return true;
-  return HasValuableParameterName(OptionalSharedName(node));
-}
-
-bool HasLookupPolicyName(const NodeDef& node, const FrozenVariable& frozen) {
-  if (HasLookupLikeName(frozen.checkpoint_key)) return true;
-  if (HasLookupLikeName(node.name())) return true;
-  return HasLookupLikeName(OptionalSharedName(node));
-}
-
-bool IsValuableFreezeCandidate(const GraphDef& graph, const Fanouts& fanouts,
-                               const NodeDef& node,
-                               const FrozenVariable& frozen,
-                               int64_t parameter_max_bytes,
-                               std::string* skip_reason) {
-  if (!IsFloatingPointDType(frozen.dtype)) {
-    *skip_reason = "non-floating dtype";
-    return false;
-  }
-  if (frozen.estimated_bytes < 0) {
-    *skip_reason = "unknown tensor size";
-    return false;
-  }
-  if (HasLookupPolicyName(node, frozen)) {
-    *skip_reason = "lookup-like name";
-    return false;
-  }
-  if (HasLookupLikeConsumer(graph, fanouts, node)) {
-    *skip_reason = "lookup-like consumer";
-    return false;
-  }
-  if (!HasValuablePolicyName(node, frozen)) {
-    *skip_reason = "not a valuable parameter name";
-    return false;
-  }
-  if (frozen.estimated_bytes > parameter_max_bytes) {
-    *skip_reason = "exceeds parameter byte limit";
-    return false;
-  }
-  if (LooksLikeLookupTableShape(frozen) &&
-      !HasDenseLikeConsumer(graph, fanouts, node)) {
-    *skip_reason = "lookup-like shape";
-    return false;
-  }
-  return true;
 }
 
 bool NodeNameExists(const GraphDef& graph, absl::string_view name);
@@ -1307,7 +1091,7 @@ std::string GetOrCreateMirrorSwitch(
   return mirror->name();
 }
 
-absl::Status RewriteResourceSwitchChain(
+absl::Status  RewriteResourceSwitchChain(
     GraphDef* graph, const Fanouts& fanouts, const NodeDef& resource_switch,
     absl::string_view data_input, const FrozenVariable& frozen,
     absl::flat_hash_map<std::string, std::string>* mirror_switches,
@@ -1624,9 +1408,6 @@ absl::Status FreezeReadonlyVariablesGrapplerOptimizer::Optimize(
   }
 
   RewriteStats stats;
-  const FreezePolicy freeze_policy = FreezePolicyFromEnv();
-  const int64_t parameter_max_bytes = ParameterMaxBytes();
-  const bool read_path_freeze = EnvFlagEnabled(kReadPathFreezeEnvVar);
   Fanouts fanouts = BuildDataFanouts(*optimized_graph);
   absl::flat_hash_map<std::string, FrozenVariable> frozen_by_node_name;
   std::vector<std::pair<std::string, FrozenVariable>> variables_to_replace;
@@ -1673,13 +1454,13 @@ absl::Status FreezeReadonlyVariablesGrapplerOptimizer::Optimize(
         IsSafeToFreeze(*optimized_graph, fanouts, *node, frozen);
     ReadPathAnalysis read_path_analysis;
     const bool safe_to_rewrite_read_path =
-        read_path_freeze && !safe_to_replace &&
+        !safe_to_replace &&
         IsSafeToReadPathFreeze(*optimized_graph, fanouts, *node, frozen,
                                &read_path_analysis);
 
     if (!safe_to_replace && !safe_to_rewrite_read_path) {
       ++stats.skipped_unsafe;
-      if (read_path_freeze && !read_path_analysis.unsafe_reason.empty()) {
+      if (!read_path_analysis.unsafe_reason.empty()) {
         ++stats.skipped_unsupported;
       }
       VLOG(1) << "FreezeReadonlyVariablesGrappler: skip unsafe variable "
@@ -1690,21 +1471,6 @@ absl::Status FreezeReadonlyVariablesGrapplerOptimizer::Optimize(
                       : strings::StrCat(" reason=",
                                         read_path_analysis.unsafe_reason));
       continue;
-    }
-
-    if (freeze_policy == FreezePolicy::kValuableParameters) {
-      std::string skip_reason;
-      if (!IsValuableFreezeCandidate(*optimized_graph, fanouts, *node, frozen,
-                                     parameter_max_bytes, &skip_reason)) {
-        ++stats.skipped_policy;
-        VLOG(1) << "FreezeReadonlyVariablesGrappler: skip by policy node="
-                << node->name() << " shared_name=" << OptionalSharedName(*node)
-                << " checkpoint_key=" << frozen.checkpoint_key
-                << " reason=" << skip_reason
-                << " estimated_bytes=" << frozen.estimated_bytes
-                << " dtype=" << DataTypeString(frozen.dtype);
-        continue;
-      }
     }
 
     if (safe_to_replace) {
@@ -1792,9 +1558,6 @@ absl::Status FreezeReadonlyVariablesGrapplerOptimizer::Optimize(
 
   LOG(INFO)
       << "FreezeReadonlyVariablesGrappler checkpoint=" << checkpoint_prefix_
-      << " policy=" << FreezePolicyName(freeze_policy)
-      << " parameter_max_bytes=" << parameter_max_bytes
-      << " read_path_freeze=" << read_path_freeze
       << " candidates=" << stats.candidates
       << " frozen_variables=" << stats.frozen_variables
       << " read_path_variables=" << stats.read_path_variables
@@ -1813,8 +1576,7 @@ absl::Status FreezeReadonlyVariablesGrapplerOptimizer::Optimize(
       << " skipped_too_large=" << stats.skipped_too_large
       << " skipped_partitioned=" << stats.skipped_partitioned
       << " skipped_unsafe=" << stats.skipped_unsafe
-      << " skipped_unsupported=" << stats.skipped_unsupported
-      << " skipped_policy=" << stats.skipped_policy;
+      << " skipped_unsupported=" << stats.skipped_unsupported;
   return absl::OkStatus();
 }
 
