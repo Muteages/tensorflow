@@ -3,7 +3,6 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
-#include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
 #include "tensorflow/core/framework/attr_value.pb.h"
 #include "tensorflow/core/framework/function.pb.h"
@@ -38,27 +37,8 @@ constexpr char kOptimizerMaxTensorBytesEnvVar[] =
 constexpr int64_t kDefaultMaxTensorBytes = 1LL * 1024 * 1024; // Set default to 1 MiB to avoid OOM when accidentally freezing large variables.
 
 struct FrozenVariable {
-  std::string checkpoint_key;
   DataType dtype = DT_INVALID;
-  int64_t estimated_bytes = -1;
   TensorProto value;
-};
-
-struct RewriteStats {
-  int candidates = 0;
-  int frozen_variables = 0;
-  int read_path_variables = 0;
-  int rewritten_reads = 0;
-  int rewritten_varhandle_direct_reads = 0;
-  int rewritten_varhandle_switch_reads = 0;
-  int rewritten_variablev2_reads = 0;
-  int ignored_var_is_initialized = 0;
-  int preserved_assigns = 0;
-  int skipped_missing_value = 0;
-  int skipped_too_large = 0;
-  int skipped_partitioned = 0;
-  int skipped_unsafe = 0;
-  int skipped_unsupported = 0;
 };
 
 int64_t MaxTensorBytes() {
@@ -264,9 +244,7 @@ class CheckpointTensorReader {
       status = reader_.Lookup(key, &tensor);
       if (!status.ok()) return status;
 
-      frozen->checkpoint_key = key;
       frozen->dtype = dtype;
-      frozen->estimated_bytes = estimated_bytes;
       tensor.AsProtoTensorContent(&frozen->value);
       return absl::OkStatus();
     }
@@ -400,25 +378,12 @@ bool IsSafeToFreeze(const GraphDef& graph, const Fanouts& fanouts,
 
 struct ReadPathAnalysis {
   int compute_read_paths = 0;
-  int varhandle_direct_reads = 0;
-  int varhandle_switch_reads = 0;
-  int variablev2_reads = 0;
-  int ignored_var_is_initialized = 0;
-  int preserved_assigns = 0;
-  std::string unsafe_reason;
 };
 
 struct ReadPathRewriteCandidate {
   std::string node_name;
   FrozenVariable frozen;
-  ReadPathAnalysis analysis;
 };
-
-void SetUnsafeReason(absl::string_view reason, ReadPathAnalysis* analysis) {
-  if (analysis != nullptr && analysis->unsafe_reason.empty()) {
-    analysis->unsafe_reason = std::string(reason);
-  }
-}
 
 bool IsNodeInStack(const std::vector<std::string>& stack,
                    absl::string_view node_name) {
@@ -449,16 +414,9 @@ bool AnalyzeResourceSwitchChain(const GraphDef& graph, const Fanouts& fanouts,
                                 ReadPathAnalysis* analysis) {
   if (switch_node.op() != "Switch" ||
       !AttrTypeEquals(switch_node, "T", DT_RESOURCE)) {
-    SetUnsafeReason(
-        strings::StrCat("unsupported resource switch node ", switch_node.name(),
-                        " op=", switch_node.op()),
-        analysis);
     return false;
   }
   if (IsNodeInStack(*stack, switch_node.name())) {
-    SetUnsafeReason(strings::StrCat("cycle in resource switch chain at ",
-                                    switch_node.name()),
-                    analysis);
     return false;
   }
 
@@ -472,9 +430,6 @@ bool AnalyzeResourceSwitchChain(const GraphDef& graph, const Fanouts& fanouts,
   for (const std::string& consumer_name : fanout_it->second) {
     const NodeDef* consumer = FindNode(graph, consumer_name);
     if (consumer == nullptr) {
-      SetUnsafeReason(
-          strings::StrCat("missing resource switch consumer ", consumer_name),
-          analysis);
       stack->pop_back();
       return false;
     }
@@ -483,10 +438,6 @@ bool AnalyzeResourceSwitchChain(const GraphDef& graph, const Fanouts& fanouts,
     ForEachDataEdgeFrom(
         *consumer, switch_node.name(), [&](int dst_input, int src_output) {
           if (src_output != 0 && src_output != 1) {
-            SetUnsafeReason(
-                strings::StrCat("unsupported switch output ", src_output,
-                                " from ", switch_node.name()),
-                analysis);
             ok = false;
             return false;
           }
@@ -502,15 +453,9 @@ bool AnalyzeResourceSwitchChain(const GraphDef& graph, const Fanouts& fanouts,
 
           if (dst_input == 0 && IsSafeResourceConsumer(*consumer, frozen)) {
             ++analysis->compute_read_paths;
-            ++analysis->varhandle_switch_reads;
             return true;
           }
 
-          SetUnsafeReason(
-              strings::StrCat("unsupported resource switch consumer ",
-                              consumer->name(), " op=", consumer->op(),
-                              " input=", dst_input),
-              analysis);
           ok = false;
           return false;
         });
@@ -538,24 +483,17 @@ bool AnalyzeVarHandleReadPaths(const GraphDef& graph, const Fanouts& fanouts,
     ForEachDataEdgeFrom(
         *consumer, node.name(), [&](int dst_input, int src_output) {
           if (src_output != 0) {
-            SetUnsafeReason(
-                strings::StrCat("unsupported VarHandle output ", src_output,
-                                " to ", consumer->name()),
-                analysis);
             ok = false;
             return false;
           }
           if (consumer->op() == "VarIsInitializedOp" && dst_input == 0) {
-            ++analysis->ignored_var_is_initialized;
             return true;
           }
           if (consumer->op() == "AssignVariableOp" && dst_input == 0) {
-            ++analysis->preserved_assigns;
             return true;
           }
           if (dst_input == 0 && IsSafeResourceConsumer(*consumer, frozen)) {
             ++analysis->compute_read_paths;
-            ++analysis->varhandle_direct_reads;
             return true;
           }
           if (consumer->op() == "Switch" && dst_input == 0) {
@@ -568,10 +506,6 @@ bool AnalyzeVarHandleReadPaths(const GraphDef& graph, const Fanouts& fanouts,
             return true;
           }
 
-          SetUnsafeReason(strings::StrCat("unsupported VarHandle consumer ",
-                                          consumer->name(), " op=",
-                                          consumer->op(), " input=", dst_input),
-                          analysis);
           ok = false;
           return false;
         });
@@ -583,13 +517,6 @@ bool AnalyzeVarHandleReadPaths(const GraphDef& graph, const Fanouts& fanouts,
 bool IsPreservedVariableV2Consumer(const NodeDef& consumer, int dst_input) {
   return (consumer.op() == "Assign" && dst_input == 0) ||
          consumer.op() == "Save" || consumer.op() == "SaveV2";
-}
-
-void RecordPreservedVariableV2Consumer(const NodeDef& consumer, int dst_input,
-                                       ReadPathAnalysis* analysis) {
-  if (analysis != nullptr && consumer.op() == "Assign" && dst_input == 0) {
-    ++analysis->preserved_assigns;
-  }
 }
 
 bool HasSaveOutputConsumer(const GraphDef& graph, const Fanouts& fanouts,
@@ -613,9 +540,6 @@ bool HasSupportedValueOutputConsumers(const GraphDef& graph,
                                       ReadPathAnalysis* analysis) {
   const auto fanout_it = fanouts.find(node.name());
   if (fanout_it == fanouts.end()) {
-    SetUnsafeReason(
-        strings::StrCat("VariableV2 read has no data outputs ", node.name()),
-        analysis);
     return false;
   }
 
@@ -623,10 +547,6 @@ bool HasSupportedValueOutputConsumers(const GraphDef& graph,
   for (const std::string& consumer_name : fanout_it->second) {
     const NodeDef* consumer = FindNode(graph, consumer_name);
     if (consumer == nullptr) {
-      SetUnsafeReason(
-          strings::StrCat("missing VariableV2 read output consumer ",
-                          consumer_name),
-          analysis);
       return false;
     }
 
@@ -635,53 +555,25 @@ bool HasSupportedValueOutputConsumers(const GraphDef& graph,
         *consumer, node.name(), [&](int dst_input, int src_output) {
           has_output = true;
           if (src_output != 0) {
-            SetUnsafeReason(strings::StrCat("unsupported VariableV2 read "
-                                            "output ",
-                                            src_output, " from ", node.name()),
-                            analysis);
             ok = false;
             return false;
           }
 
           if (consumer->op() == "Save" || consumer->op() == "SaveV2") {
-            SetUnsafeReason(
-                strings::StrCat("VariableV2 read feeds save "
-                                "path ",
-                                node.name(), " -> ", consumer->name()),
-                analysis);
             ok = false;
             return false;
           }
           if (IsMutatingVariableOp(consumer->op())) {
-            SetUnsafeReason(
-                strings::StrCat("VariableV2 read feeds "
-                                "mutating op ",
-                                node.name(), " -> ", consumer->name(),
-                                " op=", consumer->op()),
-                analysis);
             ok = false;
             return false;
           }
 
           DataType input_type = DT_INVALID;
           if (!ResolveInputType(*consumer, dst_input, &input_type)) {
-            SetUnsafeReason(
-                strings::StrCat("invalid VariableV2 read "
-                                "output input ",
-                                consumer->name(), " op=", consumer->op(),
-                                " input=", dst_input),
-                analysis);
             ok = false;
             return false;
           }
           if (IsRefType(input_type) || BaseType(input_type) != frozen.dtype) {
-            SetUnsafeReason(
-                strings::StrCat("unsupported VariableV2 read "
-                                "output type ",
-                                consumer->name(), " op=", consumer->op(),
-                                " input=", dst_input,
-                                " dtype=", DataTypeString(input_type)),
-                analysis);
             ok = false;
             return false;
           }
@@ -691,9 +583,6 @@ bool HasSupportedValueOutputConsumers(const GraphDef& graph,
   }
 
   if (!has_output) {
-    SetUnsafeReason(
-        strings::StrCat("VariableV2 read has no data outputs ", node.name()),
-        analysis);
     return false;
   }
   return true;
@@ -714,37 +603,23 @@ bool IsSupportedVariableV2ComputeConsumer(
       return false;
     }
     ++analysis->compute_read_paths;
-    ++analysis->variablev2_reads;
     return true;
   }
 
   if (HasSaveOutputConsumer(graph, fanouts, consumer)) {
-    SetUnsafeReason(strings::StrCat("VariableV2 read feeds save path ",
-                                    consumer.name(), " op=", consumer.op()),
-                    analysis);
     return false;
   }
 
   DataType input_type = DT_INVALID;
   if (!ResolveInputType(consumer, dst_input, &input_type)) {
-    SetUnsafeReason(
-        strings::StrCat("invalid VariableV2 consumer input ", consumer.name(),
-                        " op=", consumer.op(), " input=", dst_input),
-        analysis);
     return false;
   }
 
   if (IsRefType(input_type) || BaseType(input_type) != frozen.dtype) {
-    SetUnsafeReason(strings::StrCat("unsupported VariableV2 consumer type ",
-                                    consumer.name(), " op=", consumer.op(),
-                                    " input=", dst_input,
-                                    " dtype=", DataTypeString(input_type)),
-                    analysis);
     return false;
   }
 
   ++analysis->compute_read_paths;
-  ++analysis->variablev2_reads;
   return true;
 }
 
@@ -763,23 +638,13 @@ bool AnalyzeVariableV2ReadPaths(const GraphDef& graph, const Fanouts& fanouts,
     ForEachDataEdgeFrom(
         *consumer, node.name(), [&](int dst_input, int src_output) {
           if (src_output != 0) {
-            SetUnsafeReason(
-                strings::StrCat("unsupported VariableV2 output ", src_output,
-                                " to ", consumer->name()),
-                analysis);
             ok = false;
             return false;
           }
           if (IsPreservedVariableV2Consumer(*consumer, dst_input)) {
-            RecordPreservedVariableV2Consumer(*consumer, dst_input, analysis);
             return true;
           }
           if (IsMutatingVariableOp(consumer->op())) {
-            SetUnsafeReason(
-                strings::StrCat("unsupported mutating VariableV2 consumer ",
-                                consumer->name(), " op=", consumer->op(),
-                                " input=", dst_input),
-                analysis);
             ok = false;
             return false;
           }
@@ -799,8 +664,6 @@ bool IsSafeToReadPathFreeze(const GraphDef& graph, const Fanouts& fanouts,
                             const NodeDef& node, const FrozenVariable& frozen,
                             ReadPathAnalysis* analysis) {
   if (!IsFrozenValueCompatibleWithNode(node, frozen)) {
-    SetUnsafeReason("checkpoint tensor is incompatible with variable node",
-                    analysis);
     return false;
   }
 
@@ -810,16 +673,11 @@ bool IsSafeToReadPathFreeze(const GraphDef& graph, const Fanouts& fanouts,
   } else if (node.op() == "VariableV2") {
     safe = AnalyzeVariableV2ReadPaths(graph, fanouts, node, frozen, analysis);
   } else {
-    SetUnsafeReason(strings::StrCat("unsupported variable op ", node.op()),
-                    analysis);
     return false;
   }
 
   if (!safe) return false;
-  if (analysis->compute_read_paths == 0) {
-    SetUnsafeReason("no supported compute read path", analysis);
-    return false;
-  }
+  if (analysis->compute_read_paths == 0) return false;
   return true;
 }
 
@@ -925,11 +783,11 @@ std::string GetOrCreateMirrorSwitch(
   return mirror->name();
 }
 
-absl::Status  RewriteResourceSwitchChain(
+absl::Status RewriteResourceSwitchChain(
     GraphDef* graph, const Fanouts& fanouts, const NodeDef& resource_switch,
     absl::string_view data_input, const FrozenVariable& frozen,
     absl::flat_hash_map<std::string, std::string>* mirror_switches,
-    RewriteStats* stats, int* rewritten_paths) {
+    int* rewritten_paths) {
   const NodeDef switch_copy = resource_switch;
   const std::string mirror_switch = GetOrCreateMirrorSwitch(
       graph, switch_copy, data_input, frozen, mirror_switches);
@@ -955,7 +813,7 @@ absl::Status  RewriteResourceSwitchChain(
           if (consumer_before.op() == "Switch" && dst_input == 0) {
             if (!RewriteResourceSwitchChain(
                      graph, fanouts, consumer_before, mirror_output, frozen,
-                     mirror_switches, stats, rewritten_paths)
+                     mirror_switches, rewritten_paths)
                      .ok()) {
               ok = false;
               return false;
@@ -976,8 +834,6 @@ absl::Status  RewriteResourceSwitchChain(
               ok = false;
               return false;
             }
-            ++stats->rewritten_reads;
-            ++stats->rewritten_varhandle_switch_reads;
             ++*rewritten_paths;
             return true;
           }
@@ -992,7 +848,7 @@ absl::Status RewriteVarHandleReadPaths(
     GraphDef* graph, const Fanouts& fanouts, const NodeDef& variable,
     absl::string_view frozen_const, const FrozenVariable& frozen,
     absl::flat_hash_map<std::string, std::string>* mirror_switches,
-    RewriteStats* stats, int* rewritten_paths) {
+    int* rewritten_paths) {
   const auto fanout_it = fanouts.find(variable.name());
   if (fanout_it == fanouts.end()) return absl::OkStatus();
 
@@ -1018,15 +874,13 @@ absl::Status RewriteVarHandleReadPaths(
               ok = false;
               return false;
             }
-            ++stats->rewritten_reads;
-            ++stats->rewritten_varhandle_direct_reads;
             ++*rewritten_paths;
             return true;
           }
           if (consumer_before.op() == "Switch" && dst_input == 0) {
             if (!RewriteResourceSwitchChain(
                      graph, fanouts, consumer_before, frozen_const, frozen,
-                     mirror_switches, stats, rewritten_paths)
+                     mirror_switches, rewritten_paths)
                      .ok()) {
               ok = false;
               return false;
@@ -1044,7 +898,6 @@ absl::Status RewriteVariableV2ReadPaths(GraphDef* graph, const Fanouts& fanouts,
                                         const NodeDef& variable,
                                         absl::string_view frozen_const,
                                         const FrozenVariable& frozen,
-                                        RewriteStats* stats,
                                         int* rewritten_paths) {
   const auto fanout_it = fanouts.find(variable.name());
   if (fanout_it == fanouts.end()) return absl::OkStatus();
@@ -1073,7 +926,6 @@ absl::Status RewriteVariableV2ReadPaths(GraphDef* graph, const Fanouts& fanouts,
               ok = false;
               return false;
             }
-            ++stats->rewritten_variablev2_reads;
             ++*rewritten_paths;
             return true;
           }
@@ -1091,7 +943,6 @@ absl::Status RewriteVariableV2ReadPaths(GraphDef* graph, const Fanouts& fanouts,
             ok = false;
             return false;
           }
-          ++stats->rewritten_variablev2_reads;
           ++*rewritten_paths;
           return true;
         });
@@ -1104,19 +955,19 @@ absl::Status RewriteReadPaths(
     GraphDef* graph, const Fanouts& fanouts, const NodeDef& variable,
     const FrozenVariable& frozen,
     absl::flat_hash_map<std::string, std::string>* frozen_const_by_node_name,
-    RewriteStats* stats, int* rewritten_paths) {
+    int* rewritten_paths) {
   const std::string frozen_const = GetOrCreateFrozenConst(
       graph, variable, frozen, frozen_const_by_node_name);
 
   if (variable.op() == "VarHandleOp") {
     absl::flat_hash_map<std::string, std::string> mirror_switches;
     return RewriteVarHandleReadPaths(graph, fanouts, variable, frozen_const,
-                                     frozen, &mirror_switches, stats,
+                                     frozen, &mirror_switches,
                                      rewritten_paths);
   }
   if (variable.op() == "VariableV2") {
     return RewriteVariableV2ReadPaths(graph, fanouts, variable, frozen_const,
-                                      frozen, stats, rewritten_paths);
+                                      frozen, rewritten_paths);
   }
   return absl::OkStatus();
 }
@@ -1169,81 +1020,39 @@ absl::Status FreezeReadonlyVariablesOptimizer::Optimize(
     return absl::OkStatus();
   }
 
-  RewriteStats stats;
+  int candidates = 0;
+  int frozen_variables = 0;
   Fanouts fanouts = BuildDataFanouts(*optimized_graph);
   absl::flat_hash_map<std::string, FrozenVariable> frozen_by_node_name;
   std::vector<std::pair<std::string, FrozenVariable>> variables_to_replace;
   std::vector<ReadPathRewriteCandidate> variables_to_rewrite_read_paths;
 
-  std::vector<std::string> node_names;
-  node_names.reserve(optimized_graph->node_size());
   for (const NodeDef& node : optimized_graph->node()) {
-    node_names.push_back(node.name());
-  }
-
-  for (const std::string& node_name : node_names) {
-    const NodeDef* node = FindNode(*optimized_graph, node_name);
-    if (node == nullptr || !IsVariableNode(*node)) continue;
-    ++stats.candidates;
+    if (!IsVariableNode(node)) continue;
+    ++candidates;
 
     FrozenVariable frozen;
-    std::vector<std::string> candidate_keys = CandidateCheckpointKeys(*node);
-    absl::Status lookup_status = tensor_reader.Lookup(candidate_keys, &frozen);
-    if (!lookup_status.ok()) {
-      if (errors::IsResourceExhausted(lookup_status)) {
-        ++stats.skipped_too_large;
-        VLOG(1) << "FreezeReadonlyVariablesOptimizer: skip large variable "
-                << node->name() << " shared_name=" << OptionalSharedName(*node)
-                << " candidates=[" << absl::StrJoin(candidate_keys, ", ")
-                << "]: " << lookup_status;
-      } else if (errors::IsFailedPrecondition(lookup_status)) {
-        ++stats.skipped_partitioned;
-        VLOG(1) << "FreezeReadonlyVariablesOptimizer: skip partitioned variable "
-                << node->name() << " shared_name=" << OptionalSharedName(*node)
-                << " candidates=[" << absl::StrJoin(candidate_keys, ", ")
-                << "]: " << lookup_status;
-      } else {
-        ++stats.skipped_missing_value;
-        VLOG(2) << "FreezeReadonlyVariablesOptimizer: no checkpoint value for "
-                << node->name() << " shared_name=" << OptionalSharedName(*node)
-                << " candidates=[" << absl::StrJoin(candidate_keys, ", ")
-                << "]: " << lookup_status;
-      }
-      continue;
-    }
+    absl::Status lookup_status =
+        tensor_reader.Lookup(CandidateCheckpointKeys(node), &frozen);
+    if (!lookup_status.ok()) continue;
 
     const bool safe_to_replace =
-        IsSafeToFreeze(*optimized_graph, fanouts, *node, frozen);
+        IsSafeToFreeze(*optimized_graph, fanouts, node, frozen);
     ReadPathAnalysis read_path_analysis;
     const bool safe_to_rewrite_read_path =
         !safe_to_replace &&
-        IsSafeToReadPathFreeze(*optimized_graph, fanouts, *node, frozen,
+        IsSafeToReadPathFreeze(*optimized_graph, fanouts, node, frozen,
                                &read_path_analysis);
 
     if (!safe_to_replace && !safe_to_rewrite_read_path) {
-      ++stats.skipped_unsafe;
-      if (!read_path_analysis.unsafe_reason.empty()) {
-        ++stats.skipped_unsupported;
-      }
-      VLOG(1) << "FreezeReadonlyVariablesOptimizer: skip unsafe variable "
-              << node->name() << " from checkpoint key "
-              << frozen.checkpoint_key
-              << (read_path_analysis.unsafe_reason.empty()
-                      ? ""
-                      : strings::StrCat(" reason=",
-                                        read_path_analysis.unsafe_reason));
       continue;
     }
 
     if (safe_to_replace) {
-      frozen_by_node_name[node->name()] = frozen;
-      variables_to_replace.push_back({node->name(), frozen});
+      frozen_by_node_name[node.name()] = frozen;
+      variables_to_replace.push_back({node.name(), frozen});
     } else {
-      stats.ignored_var_is_initialized +=
-          read_path_analysis.ignored_var_is_initialized;
-      stats.preserved_assigns += read_path_analysis.preserved_assigns;
-      variables_to_rewrite_read_paths.push_back(
-          {node->name(), frozen, read_path_analysis});
+      variables_to_rewrite_read_paths.push_back({node.name(), frozen});
     }
   }
 
@@ -1251,36 +1060,21 @@ absl::Status FreezeReadonlyVariablesOptimizer::Optimize(
     NodeDef* node = FindMutableNode(optimized_graph, entry.first);
     if (node == nullptr) continue;
     const FrozenVariable& frozen = entry.second;
-    LOG(INFO) << "FreezeReadonlyVariablesOptimizer freezing node="
-              << node->name() << " op=" << node->op()
-              << " shared_name=" << OptionalSharedName(*node)
-              << " checkpoint_key=" << frozen.checkpoint_key
-              << " estimated_bytes=" << frozen.estimated_bytes
-              << " dtype=" << DataTypeString(frozen.dtype);
     *node = ConstNodeDef(*node, frozen);
-    ++stats.frozen_variables;
+    ++frozen_variables;
   }
 
-  std::vector<std::string> consumer_node_names;
-  consumer_node_names.reserve(optimized_graph->node_size());
-  for (const NodeDef& node : optimized_graph->node()) {
-    consumer_node_names.push_back(node.name());
-  }
-
-  for (const std::string& node_name : consumer_node_names) {
-    NodeDef* node = FindMutableNode(optimized_graph, node_name);
-    if (node == nullptr) continue;
-    if (node->op() != "ReadVariableOp") {
+  for (NodeDef& node : *optimized_graph->mutable_node()) {
+    if (node.op() != "ReadVariableOp") {
       continue;
     }
 
     std::string variable_input;
-    if (!FindDataInput(*node, 0, &variable_input)) continue;
+    if (!FindDataInput(node, 0, &variable_input)) continue;
     auto frozen_it = frozen_by_node_name.find(NodeName(variable_input));
     if (frozen_it == frozen_by_node_name.end()) continue;
 
-    TF_RETURN_IF_ERROR(RewriteReadVariable(node, frozen_it->second));
-    ++stats.rewritten_reads;
+    TF_RETURN_IF_ERROR(RewriteReadVariable(&node, frozen_it->second));
   }
 
   absl::flat_hash_map<std::string, std::string> frozen_const_by_node_name;
@@ -1292,39 +1086,13 @@ absl::Status FreezeReadonlyVariablesOptimizer::Optimize(
     int rewritten_paths = 0;
     TF_RETURN_IF_ERROR(
         RewriteReadPaths(optimized_graph, fanouts, variable, candidate.frozen,
-                         &frozen_const_by_node_name, &stats, &rewritten_paths));
+                         &frozen_const_by_node_name, &rewritten_paths));
     if (rewritten_paths == 0) continue;
-    ++stats.read_path_variables;
-    LOG(INFO) << "FreezeReadonlyVariablesOptimizer freezing read paths node="
-              << variable.name() << " op=" << variable.op()
-              << " shared_name=" << OptionalSharedName(variable)
-              << " checkpoint_key=" << candidate.frozen.checkpoint_key
-              << " estimated_bytes=" << candidate.frozen.estimated_bytes
-              << " dtype=" << DataTypeString(candidate.frozen.dtype)
-              << " paths=" << rewritten_paths
-              << " direct_reads=" << candidate.analysis.varhandle_direct_reads
-              << " switch_reads=" << candidate.analysis.varhandle_switch_reads
-              << " variablev2_reads=" << candidate.analysis.variablev2_reads;
+    ++frozen_variables;
   }
 
-  LOG(INFO)
-    << "FreezeReadonlyVariablesOptimizer checkpoint=" << checkpoint_prefix_
-      << " candidates=" << stats.candidates
-      << " frozen_variables=" << stats.frozen_variables
-      << " read_path_variables=" << stats.read_path_variables
-      << " rewritten_reads=" << stats.rewritten_reads
-      << " rewritten_varhandle_direct_reads="
-      << stats.rewritten_varhandle_direct_reads
-      << " rewritten_varhandle_switch_reads="
-      << stats.rewritten_varhandle_switch_reads
-      << " rewritten_variablev2_reads=" << stats.rewritten_variablev2_reads
-      << " ignored_var_is_initialized=" << stats.ignored_var_is_initialized
-      << " preserved_assigns=" << stats.preserved_assigns
-      << " skipped_missing_value=" << stats.skipped_missing_value
-      << " skipped_too_large=" << stats.skipped_too_large
-      << " skipped_partitioned=" << stats.skipped_partitioned
-      << " skipped_unsafe=" << stats.skipped_unsafe
-      << " skipped_unsupported=" << stats.skipped_unsupported;
+  LOG(INFO) << "FreezeReadonlyVariablesOptimizer candidates=" << candidates
+            << " frozen_variables=" << frozen_variables;
   return absl::OkStatus();
 }
 
