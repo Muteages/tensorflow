@@ -55,29 +55,20 @@ int64_t MaxTensorBytes() {
 }
 
 bool EstimateTensorBytes(DataType dtype, const TensorShape& shape,
-                         int64_t* estimated_bytes) {
+                         int64_t& estimated_bytes) {
   const int64_t elements = shape.num_elements();
   const int dtype_size = DataTypeSize(dtype);
   if (elements < 0 || dtype_size <= 0) return false;
   if (elements > std::numeric_limits<int64_t>::max() / dtype_size) {
-    *estimated_bytes = std::numeric_limits<int64_t>::max();
+    estimated_bytes = std::numeric_limits<int64_t>::max();
     return true;
   }
-  *estimated_bytes = elements * dtype_size;
+  estimated_bytes = elements * dtype_size;
   return true;
 }
 
-std::string OptionalSharedName(const NodeDef& node) {
-  std::string shared_name;
-  if (GetNodeAttr(node, "shared_name", &shared_name).ok() &&
-      !shared_name.empty()) {
-    return shared_name;
-  }
-  return "";
-}
-
-bool IsVariableNode(const NodeDef& node) {
-  return node.op() == "VarHandleOp" || node.op() == "VariableV2";
+bool IsVariableNode(const NodeDef* node) {
+  return node->op() == "VarHandleOp" || node->op() == "VariableV2";
 }
 
 bool IsMutatingVariableOp(absl::string_view op) {
@@ -89,20 +80,20 @@ bool IsMutatingVariableOp(absl::string_view op) {
          absl::StartsWith(op, "Scatter");
 }
 
-std::vector<std::string> ControlInputs(const NodeDef& node) {
+std::vector<std::string> ControlInputs(const NodeDef* node) {
   std::vector<std::string> inputs;
-  for (const std::string& input : node.input()) {
+  for (const std::string& input : node->input()) {
     if (IsControlInput(input)) inputs.push_back(input);
   }
   return inputs;
 }
 
-bool FindDataInput(const NodeDef& node, int dst_input, std::string* input) {
+bool FindDataInput(const NodeDef* node, int dst_input, std::string& input) {
   int data_input = 0;
-  for (const std::string& candidate : node.input()) {
+  for (const std::string& candidate : node->input()) {
     if (IsControlInput(candidate)) continue;
     if (data_input == dst_input) {
-      *input = candidate;
+      input = candidate;
       return true;
     }
     ++data_input;
@@ -133,32 +124,32 @@ bool SetDataInput(NodeDef* node, int dst_input, absl::string_view new_input) {
   return false;
 }
 
-void CopyInternalAttrs(const NodeDef& from, NodeDef* to) {
-  for (const auto& attr : from.attr()) {
+void CopyInternalAttrs(const NodeDef* from, NodeDef* to) {
+  for (const auto& attr : from->attr()) {
     if (!attr.first.empty() && attr.first[0] == '_') {
       (*to->mutable_attr())[attr.first] = attr.second;
     }
   }
 }
 
-NodeDef BaseReplacementDef(const NodeDef& old_node, absl::string_view op) {
+NodeDef BaseReplacementDef(const NodeDef* old_node, absl::string_view op) {
   NodeDef node_def;
-  node_def.set_name(old_node.name());
+  node_def.set_name(old_node->name());
   node_def.set_op(std::string(op));
-  node_def.set_device(old_node.device());
+  node_def.set_device(old_node->device());
   CopyInternalAttrs(old_node, &node_def);
   return node_def;
 }
 
-void AddUniqueKey(absl::string_view key, std::vector<std::string>* keys) {
+void AddUniqueKey(absl::string_view key, std::vector<std::string>& keys) {
   if (key.empty()) return;
-  for (const std::string& existing : *keys) {
+  for (const std::string& existing : keys) {
     if (absl::string_view(existing) == key) return;
   }
-  keys->push_back(std::string(key));
+  keys.push_back(std::string(key));
 }
 
-void AddCheckpointKey(absl::string_view key, std::vector<std::string>* keys) {
+void AddCheckpointKey(absl::string_view key, std::vector<std::string>& keys) {
   AddUniqueKey(key, keys);
   AddUniqueKey(strings::StrCat(key, "/.ATTRIBUTES/VARIABLE_VALUE"), keys);
 }
@@ -173,7 +164,7 @@ bool HasPartSuffix(absl::string_view value, size_t part_pos) {
 }
 
 void AddCandidateCheckpointKeyVariants(absl::string_view key,
-                                       std::vector<std::string>* keys) {
+                                       std::vector<std::string>& keys) {
   if (key.empty()) return;
 
   std::vector<std::string> bases;
@@ -192,13 +183,16 @@ void AddCandidateCheckpointKeyVariants(absl::string_view key,
   }
 }
 
-std::vector<std::string> CandidateCheckpointKeys(const NodeDef& node) {
+std::vector<std::string> CandidateCheckpointKeys(const NodeDef* node) {
   std::vector<std::string> keys;
-  const std::string shared_name = OptionalSharedName(node);
-  if (!shared_name.empty()) {
-    AddCandidateCheckpointKeyVariants(shared_name, &keys);
+  std::string shared_name;
+  if (!GetNodeAttr(*node, "shared_name", &shared_name).ok()) {
+    shared_name.clear();
   }
-  AddCandidateCheckpointKeyVariants(node.name(), &keys);
+  if (!shared_name.empty()) {
+    AddCandidateCheckpointKeyVariants(shared_name, keys);
+  }
+  AddCandidateCheckpointKeyVariants(node->name(), keys);
   return keys;
 }
 
@@ -211,7 +205,7 @@ class CheckpointTensorReader {
   absl::Status status() const { return reader_.status(); }
 
   absl::Status Lookup(const std::vector<std::string>& keys,
-                      FrozenVariable* frozen) {
+                      FrozenVariable& frozen) {
     for (const std::string& key : keys) {
       if (!reader_.Contains(key)) continue;
 
@@ -231,7 +225,7 @@ class CheckpointTensorReader {
       if (!status.ok()) return status;
 
       int64_t estimated_bytes = -1;
-      if (EstimateTensorBytes(dtype, shape, &estimated_bytes) &&
+        if (EstimateTensorBytes(dtype, shape, estimated_bytes) &&
           estimated_bytes > max_tensor_bytes_) {
         return errors::ResourceExhausted(
             "checkpoint tensor exceeds freeze byte limit: key=", key,
@@ -244,8 +238,8 @@ class CheckpointTensorReader {
       status = reader_.Lookup(key, &tensor);
       if (!status.ok()) return status;
 
-      frozen->dtype = dtype;
-      tensor.AsProtoTensorContent(&frozen->value);
+      frozen.dtype = dtype;
+      tensor.AsProtoTensorContent(&frozen.value);
       return absl::OkStatus();
     }
     return errors::NotFound("no checkpoint tensor for variable");
@@ -256,22 +250,22 @@ class CheckpointTensorReader {
   const int64_t max_tensor_bytes_;
 };
 
-bool AttrTypeEquals(const NodeDef& node, absl::string_view attr_name,
+bool AttrTypeEquals(const NodeDef* node, absl::string_view attr_name,
                     DataType expected) {
   DataType actual = DT_INVALID;
-  return GetNodeAttr(node, attr_name, &actual).ok() && actual == expected;
+  return GetNodeAttr(*node, attr_name, &actual).ok() && actual == expected;
 }
 
-bool IsFrozenValueCompatibleWithNode(const NodeDef& node,
+bool IsFrozenValueCompatibleWithNode(const NodeDef* node,
                                      const FrozenVariable& frozen) {
   DataType node_dtype = DT_INVALID;
-  if (GetNodeAttr(node, "dtype", &node_dtype).ok() &&
+  if (GetNodeAttr(*node, "dtype", &node_dtype).ok() &&
       node_dtype != frozen.dtype) {
     return false;
   }
 
   PartialTensorShape node_shape;
-  if (!GetNodeAttr(node, "shape", &node_shape).ok()) {
+  if (!GetNodeAttr(*node, "shape", &node_shape).ok()) {
     return true;
   }
 
@@ -285,26 +279,26 @@ bool IsFrozenValueCompatibleWithNode(const NodeDef& node,
   return node_shape.IsCompatibleWith(frozen_shape);
 }
 
-bool IsSafeResourceConsumer(const NodeDef& consumer,
+bool IsSafeResourceConsumer(const NodeDef* consumer,
                             const FrozenVariable& frozen) {
-  if (consumer.op() == "ReadVariableOp") {
+  if (consumer->op() == "ReadVariableOp") {
     return AttrTypeEquals(consumer, "dtype", frozen.dtype);
   }
   return false;
 }
 
-bool ResolveInputType(const NodeDef& node, int input_index,
-                      DataType* input_type) {
+bool ResolveInputType(const NodeDef* node, int input_index,
+                      DataType& input_type) {
   const OpDef* op_def = nullptr;
-  return OpRegistry::Global()->LookUpOpDef(node.op(), &op_def).ok() &&
-         InputTypeForNode(node, *op_def, input_index, input_type).ok();
+  return OpRegistry::Global()->LookUpOpDef(node->op(), &op_def).ok() &&
+         InputTypeForNode(*node, *op_def, input_index, &input_type).ok();
 }
 
 using Fanouts = absl::flat_hash_map<std::string, std::vector<std::string>>;
 
-Fanouts BuildDataFanouts(const GraphDef& graph) {
+Fanouts BuildDataFanouts(const GraphDef* graph) {
   Fanouts fanouts;
-  for (const NodeDef& node : graph.node()) {
+  for (const NodeDef& node : graph->node()) {
     for (const std::string& input : node.input()) {
       if (IsControlInput(input)) continue;
       fanouts[NodeName(input)].push_back(node.name());
@@ -313,8 +307,8 @@ Fanouts BuildDataFanouts(const GraphDef& graph) {
   return fanouts;
 }
 
-const NodeDef* FindNode(const GraphDef& graph, absl::string_view name) {
-  for (const NodeDef& node : graph.node()) {
+const NodeDef* FindNode(const GraphDef* graph, absl::string_view name) {
+  for (const NodeDef& node : graph->node()) {
     if (node.name() == name) return &node;
   }
   return nullptr;
@@ -327,10 +321,10 @@ NodeDef* FindMutableNode(GraphDef* graph, absl::string_view name) {
   return nullptr;
 }
 
-bool ForEachDataInputFrom(const NodeDef& consumer, absl::string_view producer,
+bool ForEachDataInputFrom(const NodeDef* consumer, absl::string_view producer,
                           const std::function<bool(int)>& visit) {
   int data_input = 0;
-  for (const std::string& input : consumer.input()) {
+  for (const std::string& input : consumer->input()) {
     if (IsControlInput(input)) continue;
     if (NodeName(input) == producer && !visit(data_input)) return false;
     ++data_input;
@@ -338,13 +332,13 @@ bool ForEachDataInputFrom(const NodeDef& consumer, absl::string_view producer,
   return true;
 }
 
-bool IsSafeToFreeze(const GraphDef& graph, const Fanouts& fanouts,
-                    const NodeDef& node, const FrozenVariable& frozen) {
+bool IsSafeToFreeze(const GraphDef* graph, const Fanouts& fanouts,
+                    const NodeDef* node, const FrozenVariable& frozen) {
   if (!IsFrozenValueCompatibleWithNode(node, frozen)) {
     return false;
   }
 
-  const auto fanout_it = fanouts.find(node.name());
+  const auto fanout_it = fanouts.find(node->name());
   if (fanout_it == fanouts.end()) return true;
 
   for (const std::string& consumer_name : fanout_it->second) {
@@ -352,19 +346,19 @@ bool IsSafeToFreeze(const GraphDef& graph, const Fanouts& fanouts,
     if (consumer == nullptr) return false;
     if (IsMutatingVariableOp(consumer->op())) return false;
 
-    if (node.op() == "VarHandleOp") {
-      if (!IsSafeResourceConsumer(*consumer, frozen)) return false;
+    if (node->op() == "VarHandleOp") {
+      if (!IsSafeResourceConsumer(consumer, frozen)) return false;
       bool ok = true;
-      ForEachDataInputFrom(*consumer, node.name(), [&](int dst_input) {
+      ForEachDataInputFrom(consumer, node->name(), [&](int dst_input) {
         if (dst_input != 0) ok = false;
         return ok;
       });
       if (!ok) return false;
-    } else if (node.op() == "VariableV2") {
+    } else if (node->op() == "VariableV2") {
       bool ok = true;
-      ForEachDataInputFrom(*consumer, node.name(), [&](int dst_input) {
+      ForEachDataInputFrom(consumer, node->name(), [&](int dst_input) {
         DataType input_type = DT_INVALID;
-        if (!ResolveInputType(*consumer, dst_input, &input_type) ||
+        if (!ResolveInputType(consumer, dst_input, input_type) ||
             IsRefType(input_type)) {
           ok = false;
         }
@@ -393,10 +387,10 @@ bool IsNodeInStack(const std::vector<std::string>& stack,
   return false;
 }
 
-bool ForEachDataEdgeFrom(const NodeDef& consumer, absl::string_view producer,
+bool ForEachDataEdgeFrom(const NodeDef* consumer, absl::string_view producer,
                          const std::function<bool(int, int)>& visit) {
   int data_input = 0;
-  for (const std::string& input : consumer.input()) {
+  for (const std::string& input : consumer->input()) {
     if (IsControlInput(input)) continue;
     const TensorId tensor_id = ParseTensorName(input);
     if (tensor_id.node() == producer && !visit(data_input, tensor_id.index())) {
@@ -407,52 +401,52 @@ bool ForEachDataEdgeFrom(const NodeDef& consumer, absl::string_view producer,
   return true;
 }
 
-bool AnalyzeResourceSwitchChain(const GraphDef& graph, const Fanouts& fanouts,
-                                const NodeDef& switch_node,
-                                const FrozenVariable& frozen,
-                                std::vector<std::string>* stack,
-                                ReadPathAnalysis* analysis) {
-  if (switch_node.op() != "Switch" ||
+bool AnalyzeResourceSwitch(const GraphDef* graph, const Fanouts& fanouts,
+                           const NodeDef* switch_node,
+                           const FrozenVariable& frozen,
+                           std::vector<std::string>& stack,
+                           ReadPathAnalysis& analysis) {
+  if (switch_node->op() != "Switch" ||
       !AttrTypeEquals(switch_node, "T", DT_RESOURCE)) {
     return false;
   }
-  if (IsNodeInStack(*stack, switch_node.name())) {
+  if (IsNodeInStack(stack, switch_node->name())) {
     return false;
   }
 
-  stack->push_back(switch_node.name());
-  const auto fanout_it = fanouts.find(switch_node.name());
+  stack.push_back(switch_node->name());
+  const auto fanout_it = fanouts.find(switch_node->name());
   if (fanout_it == fanouts.end()) {
-    stack->pop_back();
+    stack.pop_back();
     return true;
   }
 
   for (const std::string& consumer_name : fanout_it->second) {
     const NodeDef* consumer = FindNode(graph, consumer_name);
     if (consumer == nullptr) {
-      stack->pop_back();
+      stack.pop_back();
       return false;
     }
 
     bool ok = true;
     ForEachDataEdgeFrom(
-        *consumer, switch_node.name(), [&](int dst_input, int src_output) {
+        consumer, switch_node->name(), [&](int dst_input, int src_output) {
           if (src_output != 0 && src_output != 1) {
             ok = false;
             return false;
           }
 
           if (consumer->op() == "Switch" && dst_input == 0) {
-            if (!AnalyzeResourceSwitchChain(graph, fanouts, *consumer, frozen,
-                                            stack, analysis)) {
+            if (!AnalyzeResourceSwitch(graph, fanouts, consumer, frozen,
+                                       stack, analysis)) {
               ok = false;
               return false;
             }
             return true;
           }
 
-          if (dst_input == 0 && IsSafeResourceConsumer(*consumer, frozen)) {
-            ++analysis->compute_read_paths;
+          if (dst_input == 0 && IsSafeResourceConsumer(consumer, frozen)) {
+            ++analysis.compute_read_paths;
             return true;
           }
 
@@ -460,19 +454,19 @@ bool AnalyzeResourceSwitchChain(const GraphDef& graph, const Fanouts& fanouts,
           return false;
         });
     if (!ok) {
-      stack->pop_back();
+      stack.pop_back();
       return false;
     }
   }
-  stack->pop_back();
+  stack.pop_back();
   return true;
 }
 
-bool AnalyzeVarHandleReadPaths(const GraphDef& graph, const Fanouts& fanouts,
-                               const NodeDef& node,
+bool AnalyzeVarHandleReadPaths(const GraphDef* graph, const Fanouts& fanouts,
+                               const NodeDef* node,
                                const FrozenVariable& frozen,
-                               ReadPathAnalysis* analysis) {
-  const auto fanout_it = fanouts.find(node.name());
+                               ReadPathAnalysis& analysis) {
+  const auto fanout_it = fanouts.find(node->name());
   if (fanout_it == fanouts.end()) return true;
 
   for (const std::string& consumer_name : fanout_it->second) {
@@ -481,7 +475,7 @@ bool AnalyzeVarHandleReadPaths(const GraphDef& graph, const Fanouts& fanouts,
 
     bool ok = true;
     ForEachDataEdgeFrom(
-        *consumer, node.name(), [&](int dst_input, int src_output) {
+        consumer, node->name(), [&](int dst_input, int src_output) {
           if (src_output != 0) {
             ok = false;
             return false;
@@ -492,14 +486,14 @@ bool AnalyzeVarHandleReadPaths(const GraphDef& graph, const Fanouts& fanouts,
           if (consumer->op() == "AssignVariableOp" && dst_input == 0) {
             return true;
           }
-          if (dst_input == 0 && IsSafeResourceConsumer(*consumer, frozen)) {
-            ++analysis->compute_read_paths;
+          if (dst_input == 0 && IsSafeResourceConsumer(consumer, frozen)) {
+            ++analysis.compute_read_paths;
             return true;
           }
           if (consumer->op() == "Switch" && dst_input == 0) {
             std::vector<std::string> stack;
-            if (!AnalyzeResourceSwitchChain(graph, fanouts, *consumer, frozen,
-                                            &stack, analysis)) {
+            if (!AnalyzeResourceSwitch(graph, fanouts, consumer, frozen,
+                                       stack, analysis)) {
               ok = false;
               return false;
             }
@@ -514,14 +508,14 @@ bool AnalyzeVarHandleReadPaths(const GraphDef& graph, const Fanouts& fanouts,
   return true;
 }
 
-bool IsPreservedVariableV2Consumer(const NodeDef& consumer, int dst_input) {
-  return (consumer.op() == "Assign" && dst_input == 0) ||
-         consumer.op() == "Save" || consumer.op() == "SaveV2";
+bool IsPreservedVariableV2Consumer(const NodeDef* consumer, int dst_input) {
+  return (consumer->op() == "Assign" && dst_input == 0) ||
+         consumer->op() == "Save" || consumer->op() == "SaveV2";
 }
 
-bool HasSaveOutputConsumer(const GraphDef& graph, const Fanouts& fanouts,
-                           const NodeDef& node) {
-  const auto fanout_it = fanouts.find(node.name());
+bool HasSaveOutputConsumer(const GraphDef* graph, const Fanouts& fanouts,
+                           const NodeDef* node) {
+  const auto fanout_it = fanouts.find(node->name());
   if (fanout_it == fanouts.end()) return false;
   for (const std::string& consumer_name : fanout_it->second) {
     const NodeDef* consumer = FindNode(graph, consumer_name);
@@ -533,12 +527,12 @@ bool HasSaveOutputConsumer(const GraphDef& graph, const Fanouts& fanouts,
   return false;
 }
 
-bool HasSupportedValueOutputConsumers(const GraphDef& graph,
+bool HasSupportedValueOutputConsumers(const GraphDef* graph,
                                       const Fanouts& fanouts,
-                                      const NodeDef& node,
+                                      const NodeDef* node,
                                       const FrozenVariable& frozen,
-                                      ReadPathAnalysis* analysis) {
-  const auto fanout_it = fanouts.find(node.name());
+                                      ReadPathAnalysis& analysis) {
+  const auto fanout_it = fanouts.find(node->name());
   if (fanout_it == fanouts.end()) {
     return false;
   }
@@ -552,7 +546,7 @@ bool HasSupportedValueOutputConsumers(const GraphDef& graph,
 
     bool ok = true;
     ForEachDataEdgeFrom(
-        *consumer, node.name(), [&](int dst_input, int src_output) {
+        consumer, node->name(), [&](int dst_input, int src_output) {
           has_output = true;
           if (src_output != 0) {
             ok = false;
@@ -569,7 +563,7 @@ bool HasSupportedValueOutputConsumers(const GraphDef& graph,
           }
 
           DataType input_type = DT_INVALID;
-          if (!ResolveInputType(*consumer, dst_input, &input_type)) {
+          if (!ResolveInputType(consumer, dst_input, input_type)) {
             ok = false;
             return false;
           }
@@ -588,21 +582,16 @@ bool HasSupportedValueOutputConsumers(const GraphDef& graph,
   return true;
 }
 
-bool IsVariableV2ReadIdentity(const NodeDef& consumer, int dst_input,
-                              const FrozenVariable& frozen) {
-  return consumer.op() == "Identity" && dst_input == 0 &&
-         AttrTypeEquals(consumer, "T", frozen.dtype);
-}
-
 bool IsSupportedVariableV2ComputeConsumer(
-    const GraphDef& graph, const Fanouts& fanouts, const NodeDef& consumer,
-    int dst_input, const FrozenVariable& frozen, ReadPathAnalysis* analysis) {
-  if (IsVariableV2ReadIdentity(consumer, dst_input, frozen)) {
+    const GraphDef* graph, const Fanouts& fanouts, const NodeDef* consumer,
+    int dst_input, const FrozenVariable& frozen, ReadPathAnalysis& analysis) {
+  if (consumer->op() == "Identity" && dst_input == 0 &&
+      AttrTypeEquals(consumer, "T", frozen.dtype)) {
     if (!HasSupportedValueOutputConsumers(graph, fanouts, consumer, frozen,
                                           analysis)) {
       return false;
     }
-    ++analysis->compute_read_paths;
+    ++analysis.compute_read_paths;
     return true;
   }
 
@@ -611,7 +600,7 @@ bool IsSupportedVariableV2ComputeConsumer(
   }
 
   DataType input_type = DT_INVALID;
-  if (!ResolveInputType(consumer, dst_input, &input_type)) {
+  if (!ResolveInputType(consumer, dst_input, input_type)) {
     return false;
   }
 
@@ -619,15 +608,16 @@ bool IsSupportedVariableV2ComputeConsumer(
     return false;
   }
 
-  ++analysis->compute_read_paths;
+  ++analysis.compute_read_paths;
   return true;
 }
 
-bool AnalyzeVariableV2ReadPaths(const GraphDef& graph, const Fanouts& fanouts,
-                                const NodeDef& node,
+bool AnalyzeVariableV2ReadPaths(const GraphDef* graph,
+                                const Fanouts& fanouts,
+                                const NodeDef* node,
                                 const FrozenVariable& frozen,
-                                ReadPathAnalysis* analysis) {
-  const auto fanout_it = fanouts.find(node.name());
+                                ReadPathAnalysis& analysis) {
+  const auto fanout_it = fanouts.find(node->name());
   if (fanout_it == fanouts.end()) return true;
 
   for (const std::string& consumer_name : fanout_it->second) {
@@ -636,12 +626,12 @@ bool AnalyzeVariableV2ReadPaths(const GraphDef& graph, const Fanouts& fanouts,
 
     bool ok = true;
     ForEachDataEdgeFrom(
-        *consumer, node.name(), [&](int dst_input, int src_output) {
+        consumer, node->name(), [&](int dst_input, int src_output) {
           if (src_output != 0) {
             ok = false;
             return false;
           }
-          if (IsPreservedVariableV2Consumer(*consumer, dst_input)) {
+          if (IsPreservedVariableV2Consumer(consumer, dst_input)) {
             return true;
           }
           if (IsMutatingVariableOp(consumer->op())) {
@@ -649,7 +639,7 @@ bool AnalyzeVariableV2ReadPaths(const GraphDef& graph, const Fanouts& fanouts,
             return false;
           }
           if (!IsSupportedVariableV2ComputeConsumer(
-                  graph, fanouts, *consumer, dst_input, frozen, analysis)) {
+                  graph, fanouts, consumer, dst_input, frozen, analysis)) {
             ok = false;
             return false;
           }
@@ -660,137 +650,114 @@ bool AnalyzeVariableV2ReadPaths(const GraphDef& graph, const Fanouts& fanouts,
   return true;
 }
 
-bool IsSafeToReadPathFreeze(const GraphDef& graph, const Fanouts& fanouts,
-                            const NodeDef& node, const FrozenVariable& frozen,
-                            ReadPathAnalysis* analysis) {
+bool IsSafeToReadPathFreeze(const GraphDef* graph, const Fanouts& fanouts,
+                            const NodeDef* node, const FrozenVariable& frozen,
+                            ReadPathAnalysis& analysis) {
   if (!IsFrozenValueCompatibleWithNode(node, frozen)) {
     return false;
   }
 
   bool safe = false;
-  if (node.op() == "VarHandleOp") {
+  if (node->op() == "VarHandleOp") {
     safe = AnalyzeVarHandleReadPaths(graph, fanouts, node, frozen, analysis);
-  } else if (node.op() == "VariableV2") {
+  } else if (node->op() == "VariableV2") {
     safe = AnalyzeVariableV2ReadPaths(graph, fanouts, node, frozen, analysis);
   } else {
     return false;
   }
 
   if (!safe) return false;
-  if (analysis->compute_read_paths == 0) return false;
+  if (analysis.compute_read_paths == 0) return false;
   return true;
 }
 
-bool NodeNameExists(const GraphDef& graph, absl::string_view name);
-std::string NewNodeName(const GraphDef& graph, absl::string_view base);
-
-NodeDef ConstNodeDef(const NodeDef& node, const FrozenVariable& frozen) {
-  NodeDef node_def = BaseReplacementDef(node, "Const");
-  AddNodeAttr("dtype", frozen.dtype, &node_def);
-  AddNodeAttr("value", frozen.value, &node_def);
-  SetInputs(ControlInputs(node), &node_def);
-  return node_def;
+std::string NewNodeName(const GraphDef* graph, std::string base) {
+  if (FindNode(graph, base) == nullptr) return base;
+  for (int i = 1;; ++i) {
+    std::string candidate = base + "_" + std::to_string(i);
+    if (FindNode(graph, candidate) == nullptr) 
+      return candidate;
+  }
 }
 
-NodeDef FrozenConstNodeDef(const GraphDef& graph, const NodeDef& node,
-                           const FrozenVariable& frozen) {
-  NodeDef node_def;
-  node_def.set_name(
-      NewNodeName(graph, strings::StrCat(node.name(), "/frozen_const")));
-  node_def.set_op("Const");
-  node_def.set_device(node.device());
-  CopyInternalAttrs(node, &node_def);
+NodeDef MakeConstNodeDef(absl::string_view name, const NodeDef* node,
+                         const FrozenVariable& frozen) {
+  NodeDef node_def = BaseReplacementDef(node, "Const");
+  node_def.set_name(std::string(name));
   AddNodeAttr("dtype", frozen.dtype, &node_def);
   AddNodeAttr("value", frozen.value, &node_def);
-  SetInputs(ControlInputs(node), &node_def);
+  const std::vector<std::string> control_inputs = ControlInputs(node);
+  SetInputs(control_inputs, &node_def);
   return node_def;
 }
 
 std::string GetOrCreateFrozenConst(
-    GraphDef* graph, const NodeDef& variable, const FrozenVariable& frozen,
-    absl::flat_hash_map<std::string, std::string>* frozen_const_by_node_name) {
-  auto it = frozen_const_by_node_name->find(variable.name());
-  if (it != frozen_const_by_node_name->end()) return it->second;
+    GraphDef* graph, const NodeDef* variable, const FrozenVariable& frozen,
+    absl::flat_hash_map<std::string, std::string>& frozen_const_by_node_name) {
+  auto it = frozen_const_by_node_name.find(variable->name());
+  if (it != frozen_const_by_node_name.end()) return it->second;
 
-  const NodeDef variable_copy = variable;
-  NodeDef node_def = FrozenConstNodeDef(*graph, variable_copy, frozen);
+  const NodeDef variable_copy = *variable;
+  const std::string frozen_const_name =
+      NewNodeName(graph, variable_copy.name() + "/frozen_const");
+  NodeDef node_def = MakeConstNodeDef(frozen_const_name, &variable_copy, frozen);
   NodeDef* frozen_const = graph->add_node();
   *frozen_const = std::move(node_def);
-  (*frozen_const_by_node_name)[variable_copy.name()] = frozen_const->name();
+  frozen_const_by_node_name[variable_copy.name()] = frozen_const->name();
   return frozen_const->name();
 }
 
-absl::Status RewriteReadVariableFromSource(NodeDef* node,
-                                           absl::string_view value_input,
-                                           const FrozenVariable& frozen) {
+void RewriteReadVariableFromSource(NodeDef* node,
+                                   absl::string_view value_input,
+                                   const FrozenVariable& frozen) {
   std::vector<std::string> inputs;
   inputs.push_back(std::string(value_input));
-  for (const std::string& input : ControlInputs(*node)) inputs.push_back(input);
+  for (const std::string& input : ControlInputs(node)) inputs.push_back(input);
 
-  NodeDef node_def = BaseReplacementDef(*node, "Identity");
+  NodeDef node_def = BaseReplacementDef(node, "Identity");
   SetInputs(inputs, &node_def);
   AddNodeAttr("T", frozen.dtype, &node_def);
   *node = std::move(node_def);
-  return absl::OkStatus();
-}
-
-absl::Status RewriteReadVariable(NodeDef* node, const FrozenVariable& frozen) {
-  std::string value_input;
-  if (!FindDataInput(*node, 0, &value_input)) return absl::OkStatus();
-  return RewriteReadVariableFromSource(node, value_input, frozen);
-}
-
-bool NodeNameExists(const GraphDef& graph, absl::string_view name) {
-  return FindNode(graph, name) != nullptr;
-}
-
-std::string NewNodeName(const GraphDef& graph, absl::string_view base) {
-  std::string candidate(base);
-  if (!NodeNameExists(graph, candidate)) return candidate;
-  for (int i = 1;; ++i) {
-    candidate = strings::StrCat(base, "_", i);
-    if (!NodeNameExists(graph, candidate)) return candidate;
-  }
 }
 
 std::string GetOrCreateMirrorSwitch(
-    GraphDef* graph, const NodeDef& resource_switch,
+    GraphDef* graph, const NodeDef* resource_switch,
     absl::string_view data_input, const FrozenVariable& frozen,
-    absl::flat_hash_map<std::string, std::string>* mirror_switches) {
-  const NodeDef switch_copy = resource_switch;
-  auto it = mirror_switches->find(switch_copy.name());
-  if (it != mirror_switches->end()) return it->second;
+    absl::flat_hash_map<std::string, std::string>& mirror_switches) {
+  const NodeDef switch_copy = *resource_switch;
+  auto it = mirror_switches.find(switch_copy.name());
+  if (it != mirror_switches.end()) return it->second;
 
   std::string pred_input;
-  if (!FindDataInput(switch_copy, 1, &pred_input)) return "";
+  if (!FindDataInput(&switch_copy, 1, pred_input)) return "";
 
   NodeDef* mirror = graph->add_node();
-  mirror->set_name(NewNodeName(
-      *graph, strings::StrCat(switch_copy.name(), "/frozen_switch")));
+    mirror->set_name(
+      NewNodeName(graph, switch_copy.name() + "/frozen_switch"));
   mirror->set_op("Switch");
   mirror->set_device(switch_copy.device());
-  CopyInternalAttrs(switch_copy, mirror);
+  CopyInternalAttrs(&switch_copy, mirror);
   std::vector<std::string> inputs;
   inputs.push_back(std::string(data_input));
   inputs.push_back(pred_input);
-  for (const std::string& input : ControlInputs(switch_copy)) {
+  for (const std::string& input : ControlInputs(&switch_copy)) {
     inputs.push_back(input);
   }
   SetInputs(inputs, mirror);
   AddNodeAttr("T", frozen.dtype, mirror);
 
-  (*mirror_switches)[switch_copy.name()] = mirror->name();
+  mirror_switches[switch_copy.name()] = mirror->name();
   return mirror->name();
 }
 
-absl::Status RewriteResourceSwitchChain(
-    GraphDef* graph, const Fanouts& fanouts, const NodeDef& resource_switch,
+absl::Status RewriteResourceSwitch(
+    GraphDef* graph, const Fanouts& fanouts, const NodeDef* resource_switch,
     absl::string_view data_input, const FrozenVariable& frozen,
-    absl::flat_hash_map<std::string, std::string>* mirror_switches,
-    int* rewritten_paths) {
-  const NodeDef switch_copy = resource_switch;
+    absl::flat_hash_map<std::string, std::string>& mirror_switches,
+    int& rewritten_paths) {
+  const NodeDef switch_copy = *resource_switch;
   const std::string mirror_switch = GetOrCreateMirrorSwitch(
-      graph, switch_copy, data_input, frozen, mirror_switches);
+      graph, &switch_copy, data_input, frozen, mirror_switches);
   if (mirror_switch.empty()) {
     return errors::InvalidArgument("Switch missing pred input: ",
                                    switch_copy.name());
@@ -806,14 +773,14 @@ absl::Status RewriteResourceSwitchChain(
 
     bool ok = true;
     ForEachDataEdgeFrom(
-        consumer_before, switch_copy.name(),
+        &consumer_before, switch_copy.name(),
         [&](int dst_input, int src_output) {
           const std::string mirror_output =
               TensorName(mirror_switch, src_output);
           if (consumer_before.op() == "Switch" && dst_input == 0) {
-            if (!RewriteResourceSwitchChain(
-                     graph, fanouts, consumer_before, mirror_output, frozen,
-                     mirror_switches, rewritten_paths)
+            if (!RewriteResourceSwitch(graph, fanouts, &consumer_before,
+                                       mirror_output, frozen, mirror_switches,
+                                       rewritten_paths)
                      .ok()) {
               ok = false;
               return false;
@@ -822,19 +789,8 @@ absl::Status RewriteResourceSwitchChain(
           }
 
           if (consumer_before.op() == "ReadVariableOp" && dst_input == 0) {
-            NodeDef* mutable_consumer =
-                FindMutableNode(graph, consumer_before.name());
-            if (mutable_consumer == nullptr) {
-              ok = false;
-              return false;
-            }
-            if (!RewriteReadVariableFromSource(mutable_consumer, mirror_output,
-                                               frozen)
-                     .ok()) {
-              ok = false;
-              return false;
-            }
-            ++*rewritten_paths;
+            RewriteReadVariableFromSource(consumer, mirror_output, frozen);
+            ++rewritten_paths;
             return true;
           }
           return true;
@@ -845,11 +801,11 @@ absl::Status RewriteResourceSwitchChain(
 }
 
 absl::Status RewriteVarHandleReadPaths(
-    GraphDef* graph, const Fanouts& fanouts, const NodeDef& variable,
+    GraphDef* graph, const Fanouts& fanouts, const NodeDef* variable,
     absl::string_view frozen_const, const FrozenVariable& frozen,
-    absl::flat_hash_map<std::string, std::string>* mirror_switches,
-    int* rewritten_paths) {
-  const auto fanout_it = fanouts.find(variable.name());
+    absl::flat_hash_map<std::string, std::string>& mirror_switches,
+    int& rewritten_paths) {
+  const auto fanout_it = fanouts.find(variable->name());
   if (fanout_it == fanouts.end()) return absl::OkStatus();
 
   for (const std::string& consumer_name : fanout_it->second) {
@@ -859,28 +815,17 @@ absl::Status RewriteVarHandleReadPaths(
 
     bool ok = true;
     ForEachDataEdgeFrom(
-        consumer_before, variable.name(), [&](int dst_input, int src_output) {
+        &consumer_before, variable->name(), [&](int dst_input, int src_output) {
           if (src_output != 0) return true;
           if (consumer_before.op() == "ReadVariableOp" && dst_input == 0) {
-            NodeDef* mutable_consumer =
-                FindMutableNode(graph, consumer_before.name());
-            if (mutable_consumer == nullptr) {
-              ok = false;
-              return false;
-            }
-            if (!RewriteReadVariableFromSource(mutable_consumer, frozen_const,
-                                               frozen)
-                     .ok()) {
-              ok = false;
-              return false;
-            }
-            ++*rewritten_paths;
+            RewriteReadVariableFromSource(consumer, frozen_const, frozen);
+            ++rewritten_paths;
             return true;
           }
           if (consumer_before.op() == "Switch" && dst_input == 0) {
-            if (!RewriteResourceSwitchChain(
-                     graph, fanouts, consumer_before, frozen_const, frozen,
-                     mirror_switches, rewritten_paths)
+            if (!RewriteResourceSwitch(graph, fanouts, &consumer_before,
+                                       frozen_const, frozen, mirror_switches,
+                                       rewritten_paths)
                      .ok()) {
               ok = false;
               return false;
@@ -894,12 +839,13 @@ absl::Status RewriteVarHandleReadPaths(
   return absl::OkStatus();
 }
 
-absl::Status RewriteVariableV2ReadPaths(GraphDef* graph, const Fanouts& fanouts,
-                                        const NodeDef& variable,
+absl::Status RewriteVariableV2ReadPaths(GraphDef* graph,
+                                        const Fanouts& fanouts,
+                                        const NodeDef* variable,
                                         absl::string_view frozen_const,
                                         const FrozenVariable& frozen,
-                                        int* rewritten_paths) {
-  const auto fanout_it = fanouts.find(variable.name());
+                                        int& rewritten_paths) {
+  const auto fanout_it = fanouts.find(variable->name());
   if (fanout_it == fanouts.end()) return absl::OkStatus();
 
   for (const std::string& consumer_name : fanout_it->second) {
@@ -909,41 +855,24 @@ absl::Status RewriteVariableV2ReadPaths(GraphDef* graph, const Fanouts& fanouts,
 
     bool ok = true;
     ForEachDataEdgeFrom(
-        consumer_before, variable.name(), [&](int dst_input, int src_output) {
+        &consumer_before, variable->name(), [&](int dst_input, int src_output) {
           if (src_output != 0) return true;
-          if (IsPreservedVariableV2Consumer(consumer_before, dst_input) ||
+          if (IsPreservedVariableV2Consumer(&consumer_before, dst_input) ||
               IsMutatingVariableOp(consumer_before.op())) {
             return true;
           }
 
-          if (IsVariableV2ReadIdentity(consumer_before, dst_input, frozen)) {
-            NodeDef* mutable_consumer =
-                FindMutableNode(graph, consumer_before.name());
-            if (mutable_consumer == nullptr ||
-                !RewriteReadVariableFromSource(mutable_consumer, frozen_const,
-                                               frozen)
-                     .ok()) {
-              ok = false;
-              return false;
-            }
-            ++*rewritten_paths;
+          if (consumer_before.op() == "Identity" && dst_input == 0) {
+            RewriteReadVariableFromSource(consumer, frozen_const, frozen);
+            ++rewritten_paths;
             return true;
           }
 
-          DataType input_type = DT_INVALID;
-          if (!ResolveInputType(consumer_before, dst_input, &input_type) ||
-              IsRefType(input_type) || BaseType(input_type) != frozen.dtype) {
-            return true;
-          }
-
-          NodeDef* mutable_consumer =
-              FindMutableNode(graph, consumer_before.name());
-          if (mutable_consumer == nullptr ||
-              !SetDataInput(mutable_consumer, dst_input, frozen_const)) {
+          if (!SetDataInput(consumer, dst_input, frozen_const)) {
             ok = false;
             return false;
           }
-          ++*rewritten_paths;
+          ++rewritten_paths;
           return true;
         });
     if (!ok) return errors::Internal("failed to rewrite VariableV2 read path");
@@ -952,20 +881,20 @@ absl::Status RewriteVariableV2ReadPaths(GraphDef* graph, const Fanouts& fanouts,
 }
 
 absl::Status RewriteReadPaths(
-    GraphDef* graph, const Fanouts& fanouts, const NodeDef& variable,
+    GraphDef* graph, const Fanouts& fanouts, const NodeDef* variable,
     const FrozenVariable& frozen,
-    absl::flat_hash_map<std::string, std::string>* frozen_const_by_node_name,
-    int* rewritten_paths) {
+    absl::flat_hash_map<std::string, std::string>& frozen_const_by_node_name,
+    int& rewritten_paths) {
   const std::string frozen_const = GetOrCreateFrozenConst(
       graph, variable, frozen, frozen_const_by_node_name);
 
-  if (variable.op() == "VarHandleOp") {
+  if (variable->op() == "VarHandleOp") {
     absl::flat_hash_map<std::string, std::string> mirror_switches;
     return RewriteVarHandleReadPaths(graph, fanouts, variable, frozen_const,
-                                     frozen, &mirror_switches,
+                                     frozen, mirror_switches,
                                      rewritten_paths);
   }
-  if (variable.op() == "VariableV2") {
+  if (variable->op() == "VariableV2") {
     return RewriteVariableV2ReadPaths(graph, fanouts, variable, frozen_const,
                                       frozen, rewritten_paths);
   }
@@ -1022,27 +951,27 @@ absl::Status FreezeReadonlyVariablesOptimizer::Optimize(
 
   int candidates = 0;
   int frozen_variables = 0;
-  Fanouts fanouts = BuildDataFanouts(*optimized_graph);
+  Fanouts fanouts = BuildDataFanouts(optimized_graph);
   absl::flat_hash_map<std::string, FrozenVariable> frozen_by_node_name;
   std::vector<std::pair<std::string, FrozenVariable>> variables_to_replace;
   std::vector<ReadPathRewriteCandidate> variables_to_rewrite_read_paths;
 
   for (const NodeDef& node : optimized_graph->node()) {
-    if (!IsVariableNode(node)) continue;
+    if (!IsVariableNode(&node)) continue;
     ++candidates;
 
     FrozenVariable frozen;
     absl::Status lookup_status =
-        tensor_reader.Lookup(CandidateCheckpointKeys(node), &frozen);
+        tensor_reader.Lookup(CandidateCheckpointKeys(&node), frozen);
     if (!lookup_status.ok()) continue;
 
     const bool safe_to_replace =
-        IsSafeToFreeze(*optimized_graph, fanouts, node, frozen);
+        IsSafeToFreeze(optimized_graph, fanouts, &node, frozen);
     ReadPathAnalysis read_path_analysis;
     const bool safe_to_rewrite_read_path =
         !safe_to_replace &&
-        IsSafeToReadPathFreeze(*optimized_graph, fanouts, node, frozen,
-                               &read_path_analysis);
+        IsSafeToReadPathFreeze(optimized_graph, fanouts, &node, frozen,
+                               read_path_analysis);
 
     if (!safe_to_replace && !safe_to_rewrite_read_path) {
       continue;
@@ -1060,7 +989,7 @@ absl::Status FreezeReadonlyVariablesOptimizer::Optimize(
     NodeDef* node = FindMutableNode(optimized_graph, entry.first);
     if (node == nullptr) continue;
     const FrozenVariable& frozen = entry.second;
-    *node = ConstNodeDef(*node, frozen);
+    *node = MakeConstNodeDef(node->name(), node, frozen);
     ++frozen_variables;
   }
 
@@ -1070,11 +999,11 @@ absl::Status FreezeReadonlyVariablesOptimizer::Optimize(
     }
 
     std::string variable_input;
-    if (!FindDataInput(node, 0, &variable_input)) continue;
+    if (!FindDataInput(&node, 0, variable_input)) continue;
     auto frozen_it = frozen_by_node_name.find(NodeName(variable_input));
     if (frozen_it == frozen_by_node_name.end()) continue;
 
-    TF_RETURN_IF_ERROR(RewriteReadVariable(&node, frozen_it->second));
+    RewriteReadVariableFromSource(&node, variable_input, frozen_it->second);
   }
 
   absl::flat_hash_map<std::string, std::string> frozen_const_by_node_name;
@@ -1085,10 +1014,9 @@ absl::Status FreezeReadonlyVariablesOptimizer::Optimize(
     const NodeDef variable = *node;
     int rewritten_paths = 0;
     TF_RETURN_IF_ERROR(
-        RewriteReadPaths(optimized_graph, fanouts, variable, candidate.frozen,
-                         &frozen_const_by_node_name, &rewritten_paths));
-    if (rewritten_paths == 0) continue;
-    ++frozen_variables;
+        RewriteReadPaths(optimized_graph, fanouts, &variable, candidate.frozen,
+                         frozen_const_by_node_name, rewritten_paths));
+    if (rewritten_paths > 0) ++frozen_variables;
   }
 
   LOG(INFO) << "FreezeReadonlyVariablesOptimizer candidates=" << candidates
